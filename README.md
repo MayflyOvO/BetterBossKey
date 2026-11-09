@@ -1,7 +1,5 @@
 # BetterBossKey
 
-**简体中文** | [English](README.en.md)
-
 > 轻量级 Windows 窗口隐藏 / 半透明 / 老板键工具 —— 单文件、零依赖、现代深色界面。
 
 BetterBossKey 是一个用 **Rust + 原生 Win32 API** 写的小工具，编译后是**一个约 320 KB 的独立 exe**，静态链接 C 运行时，终端用户**无需安装 .NET、VC++ 运行库或任何其它依赖**，双击即用。
