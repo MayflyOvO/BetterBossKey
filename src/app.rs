@@ -2,7 +2,7 @@
 //!
 //! `App` 持有全部运行时状态，并实现各项功能：
 //!   1. 老板键：一键隐藏 / 恢复所有受管窗口（全局热键触发），可选按住显示
-//!   2. 隐藏时的附带动作：静音、切回工作窗口
+//!   2. 隐藏 / 显示时的附带动作：静音、切回工作窗口、显示时置顶
 //!   3. 自动隐藏：鼠标移出、屏幕角、锁屏 / 熄屏、接投影、耳机断开
 //!   4. 半透明：可调不透明度、鼠标穿透、Alt+滚轮调节
 //!   5. 摸鱼统计、崩溃恢复
@@ -329,6 +329,16 @@ impl App {
                 window::clear_opacity(e.hwnd);
             }
         }
+        for e in &rec.topmost {
+            if !e.is_same_window() {
+                continue;
+            }
+            if self.cfg.topmost && self.is_managed(e.hwnd) {
+                window::register_topmost(e.hwnd);
+            } else {
+                window::reset_topmost(e.hwnd);
+            }
+        }
         crate::recovery::persist();
     }
 
@@ -426,6 +436,9 @@ impl App {
                 window::set_opacity(hwnd, alpha);
                 t.opacity_applied = true;
             }
+            if self.cfg.topmost && !t.hidden_by_us {
+                window::set_topmost(hwnd);
+            }
             self.targets.push(t);
         }
     }
@@ -463,6 +476,7 @@ impl App {
                 if removed.opacity_applied {
                     window::clear_opacity(removed.hwnd);
                 }
+                window::clear_topmost(removed.hwnd);
             }
             // 从记忆表删除对应记忆项，使其不再跨重启自动恢复。规则：
             //   · 若某记忆项仍被“另一个存活目标”严格支撑（该目标的记忆标识恰好等于此项），
@@ -498,6 +512,9 @@ impl App {
             if self.cfg.transparency_enabled {
                 window::set_opacity(hwnd, opacity_to_alpha(self.cfg.opacity));
                 t.opacity_applied = true;
+            }
+            if self.cfg.topmost {
+                window::set_topmost(hwnd);
             }
             // 记入记忆表（去重），以便跨重启自动恢复。t.remembered 即“此刻加入”的身份。
             if !self
@@ -549,6 +566,7 @@ impl App {
                 if t.opacity_applied {
                     window::clear_opacity(t.hwnd);
                 }
+                window::clear_topmost(t.hwnd);
             }
             self.targets.remove(pos);
         }
@@ -752,8 +770,12 @@ impl App {
 
     /// `activate`：是否把窗口切到前台（按住显示时不抢焦点）。
     fn show_all_with(&mut self, activate: bool) {
+        let topmost = self.cfg.topmost;
         for t in &mut self.targets {
             if target_live(t) {
+                if topmost {
+                    window::set_topmost(t.hwnd);
+                }
                 if activate {
                     window::show(t.hwnd);
                 } else {
@@ -825,6 +847,26 @@ impl App {
         self.cfg.cover = on;
         self.last_fg = 0;
         self.cfg.save();
+    }
+
+    /// 开 / 关“显示时置顶”。开启时当前可见的受管窗口立即置顶；关闭时撤销本程序设置的置顶。
+    pub fn set_topmost(&mut self, on: bool) {
+        self.cfg.topmost = on;
+        if on {
+            self.keep_topmost();
+        } else {
+            window::restore_all_topmost();
+        }
+        self.cfg.save();
+    }
+
+    /// 可见的受管窗口若不再置顶（刚开启，或目标程序自行取消了置顶），把它重新置顶。
+    fn keep_topmost(&self) {
+        for t in self.targets.iter().filter(|t| target_live(t)) {
+            if window::is_visible(t.hwnd) && !window::is_topmost(t.hwnd) {
+                window::set_topmost(t.hwnd);
+            }
+        }
     }
 
     /// 记录最近位于前台的非受管普通窗口。
@@ -1344,6 +1386,7 @@ impl App {
         let delay = self.cfg.auto_hide_delay_ms;
         let reveal_delay = self.cfg.reveal_delay_ms;
         let auto_focus = self.cfg.auto_focus;
+        let topmost = self.cfg.topmost;
         let mut changed = false;
 
         for t in &mut self.targets {
@@ -1369,6 +1412,9 @@ impl App {
                                 None => t.reenter_at = Some(Instant::now()),
                                 Some(since) => {
                                     if since.elapsed().as_millis() as u32 >= reveal_delay {
+                                        if topmost {
+                                            window::set_topmost(t.hwnd);
+                                        }
                                         // 按设置决定唤出时是否抢前台焦点。
                                         if auto_focus {
                                             window::show(t.hwnd);
@@ -1601,6 +1647,9 @@ impl App {
         if self.cfg.hide_on_projector {
             self.check_displays();
         }
+        if self.cfg.topmost {
+            self.keep_topmost();
+        }
 
         let mut stats_changed = false;
         if self.cfg.stats {
@@ -1634,6 +1683,7 @@ impl App {
             // 兜底：恢复所有登记在册的隐藏 / 半透明窗口（含 identity 校验可能跳过的）。
             window::restore_all_hidden();
             window::restore_all_styled();
+            window::restore_all_topmost();
             audio::unmute_all();
         }
         if self.cfg.stats {

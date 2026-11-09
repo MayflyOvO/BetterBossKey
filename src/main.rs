@@ -108,6 +108,7 @@ fn main() {
     std::panic::set_hook(Box::new(move |info| {
         crate::win::window::restore_all_hidden();
         crate::win::window::restore_all_styled();
+        crate::win::window::restore_all_topmost();
         default_hook(info);
     }));
 
@@ -639,6 +640,7 @@ unsafe extern "system" fn wndproc(
                 }
                 crate::win::window::restore_all_hidden();
                 crate::win::window::restore_all_styled();
+                crate::win::window::restore_all_topmost();
                 crate::recovery::persist();
             }
             0

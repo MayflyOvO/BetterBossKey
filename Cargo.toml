@@ -1,6 +1,6 @@
 [package]
 name = "better-boss-key"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "BetterBossKey - 轻量级 Windows 窗口隐藏 / 半透明 / 老板键工具"
 authors = ["MayflyOvO <ckmiaojapan@gmail.com>"]

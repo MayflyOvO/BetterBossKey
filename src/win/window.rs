@@ -1,4 +1,4 @@
-//! 顶层窗口的枚举与操作：隐藏 / 显示 / 半透明。
+//! 顶层窗口的枚举与操作：隐藏 / 显示 / 半透明 / 置顶。
 //!
 //! HWND 在内部以 `isize` 形式保存（便于比较、克隆与持久化），调用 Win32 API
 //! 时再转换回指针类型。所有操作前都会用 `IsWindow` 校验句柄是否仍然有效，
@@ -17,9 +17,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GWL_EXSTYLE, GW_OWNER, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNA, WS_EX_APPWINDOW,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    SetWindowPos, ShowWindow, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, LWA_ALPHA,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNA,
+    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 
 use crate::util::from_wide;
@@ -37,6 +37,9 @@ static HIDDEN_WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 
 /// 被本程序设置了半透明 / 鼠标穿透的窗口登记表，兜底方式同上。
 static STYLED_WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// 被本程序设为置顶的窗口登记表，兜底方式同上。原本就置顶的窗口不登记，撤销时也不动它。
+static TOPMOST_WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 
 /// 一个可被管理的顶层窗口的快照信息。
 #[derive(Clone)]
@@ -239,8 +242,8 @@ fn registry_add(reg: &Mutex<Vec<isize>>, hwnd: isize) {
     }
 }
 
-/// 从登记表移除一项；有变化时同步到崩溃恢复文件。
-fn registry_remove(reg: &Mutex<Vec<isize>>, hwnd: isize) {
+/// 从登记表移除一项；有变化时同步到崩溃恢复文件。返回该项是否在册。
+fn registry_remove(reg: &Mutex<Vec<isize>>, hwnd: isize) -> bool {
     let removed = match reg.lock() {
         Ok(mut v) => {
             let n = v.len();
@@ -252,6 +255,7 @@ fn registry_remove(reg: &Mutex<Vec<isize>>, hwnd: isize) {
     if removed {
         crate::recovery::persist();
     }
+    removed
 }
 
 /// 仅登记到隐藏兜底表（不改变窗口可见性）。用于重启后重新接管“此前被我们
@@ -338,10 +342,58 @@ fn drain(reg: &Mutex<Vec<isize>>) -> Vec<isize> {
     std::mem::take(&mut *guard)
 }
 
-/// 两张登记表的快照（隐藏的、被改了样式的），供崩溃恢复文件持久化。
-pub fn registry_snapshot() -> (Vec<isize>, Vec<isize>) {
+/// 撤销所有登记在册的置顶并清空登记表。用途同 [`restore_all_hidden`]。
+pub fn restore_all_topmost() {
+    for h in drain(&TOPMOST_WINDOWS) {
+        reset_topmost(h);
+    }
+}
+
+/// 三张登记表的快照（隐藏的、被改了样式的、被置顶的），供崩溃恢复文件持久化。
+pub fn registry_snapshot() -> (Vec<isize>, Vec<isize>, Vec<isize>) {
     let get = |reg: &Mutex<Vec<isize>>| reg.try_lock().map(|v| v.clone()).unwrap_or_default();
-    (get(&HIDDEN_WINDOWS), get(&STYLED_WINDOWS))
+    (get(&HIDDEN_WINDOWS), get(&STYLED_WINDOWS), get(&TOPMOST_WINDOWS))
+}
+
+/// 窗口当前是否置顶。
+pub fn is_topmost(hwnd: isize) -> bool {
+    unsafe { GetWindowLongPtrW(as_hwnd(hwnd), GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0 }
+}
+
+/// 把窗口置顶并升到置顶层的最上方，不激活。原本不置顶的才登记，撤销时只还原我们改过的。
+pub fn set_topmost(hwnd: isize) {
+    if !is_alive(hwnd) {
+        return;
+    }
+    if !is_topmost(hwnd) {
+        registry_add(&TOPMOST_WINDOWS, hwnd);
+    }
+    place_z(hwnd, HWND_TOPMOST);
+}
+
+/// 取消由本程序设置的置顶（原本就置顶的窗口保持不变）。
+pub fn clear_topmost(hwnd: isize) {
+    if registry_remove(&TOPMOST_WINDOWS, hwnd) {
+        reset_topmost(hwnd);
+    }
+}
+
+/// 仅登记到置顶兜底表（不改变窗口状态）。用于接管上次运行时被我们置顶的窗口。
+pub fn register_topmost(hwnd: isize) {
+    registry_add(&TOPMOST_WINDOWS, hwnd);
+}
+
+/// 无条件取消置顶。
+pub fn reset_topmost(hwnd: isize) {
+    if is_alive(hwnd) {
+        place_z(hwnd, HWND_NOTOPMOST);
+    }
+}
+
+fn place_z(hwnd: isize, after: HWND) {
+    unsafe {
+        SetWindowPos(as_hwnd(hwnd), after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 }
 
 /// 给窗口设置半透明度（alpha：0=全透明，255=不透明）。

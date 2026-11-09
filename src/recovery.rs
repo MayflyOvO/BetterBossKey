@@ -1,6 +1,6 @@
 //! 崩溃恢复文件：`%APPDATA%\BetterBossKey\recovery.txt`（内部文件，无需手动编辑）。
 //!
-//! 记录此刻被本程序隐藏的窗口、被改了半透明 / 穿透样式的窗口，以及被静音的程序。
+//! 记录此刻被本程序隐藏的窗口、被改了半透明 / 穿透样式的窗口、被置顶的窗口，以及被静音的程序。
 //! 正常退出时它们都已复原，文件随之清空；若进程被强制结束（无法执行任何收尾代码），
 //! 下次启动时据此把窗口与声音找回来（见 `App::recover`）。
 
@@ -31,6 +31,7 @@ impl Entry {
 pub struct Recovery {
     pub hidden: Vec<Entry>,
     pub styled: Vec<Entry>,
+    pub topmost: Vec<Entry>,
     pub muted: Vec<String>,
 }
 
@@ -43,9 +44,9 @@ fn path() -> Option<PathBuf> {
 
 /// 把当前登记表写入恢复文件（内容不变则跳过）。
 pub fn persist() {
-    let (hidden, styled) = window::registry_snapshot();
+    let (hidden, styled, topmost) = window::registry_snapshot();
     let mut out = String::new();
-    for (key, list) in [("hidden", &hidden), ("styled", &styled)] {
+    for (key, list) in [("hidden", &hidden), ("styled", &styled), ("topmost", &topmost)] {
         for &h in list.iter() {
             if window::is_alive(h) {
                 out.push_str(&format!(
@@ -91,7 +92,7 @@ pub fn load() -> Recovery {
             continue;
         };
         match key {
-            "hidden" | "styled" => {
+            "hidden" | "styled" | "topmost" => {
                 let mut parts = value.splitn(3, '\t');
                 let (Some(h), Some(pid), Some(class)) = (parts.next(), parts.next(), parts.next())
                 else {
@@ -105,10 +106,10 @@ pub fn load() -> Recovery {
                     pid,
                     class: class.to_string(),
                 };
-                if key == "hidden" {
-                    r.hidden.push(e);
-                } else {
-                    r.styled.push(e);
+                match key {
+                    "hidden" => r.hidden.push(e),
+                    "styled" => r.styled.push(e),
+                    _ => r.topmost.push(e),
                 }
             }
             "muted" if !value.is_empty() => r.muted.push(value.to_string()),

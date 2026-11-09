@@ -61,6 +61,7 @@ pub enum Hot {
     Wage,
     Mute,
     Cover,
+    Topmost,
     AutoHide,
     DelayMinus,
     DelayPlus,
@@ -185,7 +186,7 @@ impl Stepper {
 /// 一次布局计算的结果（物理像素）。绘制与命中测试共用。
 ///
 /// 左栏：窗口列表卡片（含底部“拾取窗口”）、老板键、摸鱼统计、操作按钮；
-/// 右栏：隐藏时的动作、自动隐藏条件、半透明、隐蔽。
+/// 右栏：隐藏 / 显示时的动作、自动隐藏条件、半透明、隐蔽。
 pub struct Layout {
     pub height_needed: i32,
     /// 窗口列表卡片（含底部“拾取窗口”）。
@@ -205,6 +206,7 @@ pub struct Layout {
     pub show_btn: RECT,
     pub mute: Field,
     pub cover: Field,
+    pub topmost: Field,
     pub auto_hide: Field,
     pub hide_delay: Stepper,
     pub reveal_delay: Stepper,
@@ -245,6 +247,7 @@ impl Default for Layout {
             show_btn: ZERO,
             mute: Field::NONE,
             cover: Field::NONE,
+            topmost: Field::NONE,
             auto_hide: Field::NONE,
             hide_delay: Stepper::NONE,
             reveal_delay: Stepper::NONE,
@@ -367,11 +370,13 @@ impl App {
         let rsub = rl + s(INDENT);
         let mut y = pad;
 
-        // —— 隐藏时的动作 ——
+        // —— 隐藏 / 显示时的动作 ——
         let mute = toggle(&mut y, rl, rr, false);
-        let cover = toggle(&mut y, rl, rr, true);
+        let cover = toggle(&mut y, rl, rr, false);
+        let topmost = toggle(&mut y, rl, rr, true);
         hits.push((mute.row, Hot::Mute));
         hits.push((cover.row, Hot::Cover));
+        hits.push((topmost.row, Hot::Topmost));
         divider(&mut y, rl, rr, &mut dividers);
 
         // —— 自动隐藏条件：鼠标移出（及其子项）、屏幕角、离开、接投影、耳机断开 ——
@@ -519,6 +524,7 @@ impl App {
             show_btn,
             mute,
             cover,
+            topmost,
             auto_hide,
             hide_delay,
             reveal_delay,
@@ -597,6 +603,7 @@ impl App {
         // —— 右栏 ——
         self.draw_toggle_field(c, &layout.mute, "隐藏时静音", self.cfg.mute_on_hide, true, Hot::Mute);
         self.draw_toggle_field(c, &layout.cover, "切回工作窗口", self.cfg.cover, true, Hot::Cover);
+        self.draw_toggle_field(c, &layout.topmost, "显示时置顶", self.cfg.topmost, true, Hot::Topmost);
 
         let auto = self.cfg.auto_hide;
         self.draw_toggle_field(c, &layout.auto_hide, "鼠标移出隐藏", self.cfg.auto_hide, true, Hot::AutoHide);
@@ -955,6 +962,7 @@ impl App {
             Hot::Stats => self.set_stats(!self.cfg.stats),
             Hot::Mute => self.set_mute_on_hide(!self.cfg.mute_on_hide),
             Hot::Cover => self.set_cover(!self.cfg.cover),
+            Hot::Topmost => self.set_topmost(!self.cfg.topmost),
             Hot::Corner => self.set_corner(if self.cfg.corner == 0 { DEFAULT_CORNER } else { 0 }),
             Hot::CornerAt(k) => self.set_corner(if self.cfg.corner == k { 0 } else { k }),
             Hot::Away => self.set_hide_on_away(!self.cfg.hide_on_away),
