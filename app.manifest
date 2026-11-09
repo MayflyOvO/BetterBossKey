@@ -3,7 +3,7 @@
   <assemblyIdentity
       type="win32"
       name="BetterBossKey"
-      version="1.0.0.0"
+      version="1.1.0.0"
       processorArchitecture="*"/>
 
   <!-- 以普通用户权限运行，不申请 UAC 提权 -->

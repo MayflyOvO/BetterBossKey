@@ -1,28 +1,34 @@
 //! 应用状态与核心业务逻辑。
 //!
-//! `App` 持有全部运行时状态，并实现三大功能：
-//!   1. 老板键：一键隐藏 / 恢复所有受管窗口（全局热键触发）
-//!   2. 鼠标移出窗口后自动隐藏（基于定时器轮询光标位置）
-//!   3. 半透明：对受管窗口应用可调不透明度
+//! `App` 持有全部运行时状态，并实现各项功能：
+//!   1. 老板键：一键隐藏 / 恢复所有受管窗口（全局热键触发），可选按住显示
+//!   2. 隐藏时的附带动作：静音、切回工作窗口
+//!   3. 自动隐藏：鼠标移出、屏幕角、锁屏 / 熄屏、接投影、耳机断开
+//!   4. 半透明：可调不透明度、鼠标穿透、Alt+滚轮调节
+//!   5. 摸鱼统计、崩溃恢复
 //!
 //! GUI 的布局 / 绘制 / 交互方法定义在 `gui::ui` 中（同一 `impl App` 拆分到不同模块）。
 
 use std::time::Instant;
 
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, SYSTEMTIME};
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, DestroyWindow, GetCursorPos, KillTimer, SetForegroundWindow, SetTimer, ShowWindow,
     HICON, SW_HIDE, SW_SHOW, WM_APP,
 };
 
-use crate::config::{Config, RememberedTarget, MAX_DELAY_MS, MAX_OPACITY, MIN_DELAY_MS, MIN_OPACITY};
+use crate::config::{
+    Config, RememberedTarget, Wage, DEFAULT_CURRENCY, MAX_DELAY_MS, MAX_OPACITY, MIN_DELAY_MS,
+    MIN_OPACITY,
+};
 use crate::gui::ui::Ui;
 use crate::win::hotkey::{HkSlot, Hotkey};
 use crate::win::mouse_hook::Binding;
 use crate::win::tray::Tray;
-use crate::win::{self, mouse_hook, window};
+use crate::win::{self, audio, mouse_hook, watch, window};
 
 // —— 运行时常量 ——
 /// 老板键键盘热键的注册 id：隐藏 / 显示 / 切换（隐藏键与显示键相同时用切换）。
@@ -30,6 +36,9 @@ pub const HOTKEY_ID_HIDE: i32 = 1;
 pub const HOTKEY_ID_SHOW: i32 = 2;
 pub const HOTKEY_ID_TOGGLE: i32 = 3;
 pub const TIMER_ID: usize = 1;
+/// “按住显示”期间轮询按键是否松开的定时器。
+pub const PEEK_TIMER_ID: usize = 2;
+const PEEK_POLL_MS: u32 = 15;
 /// 定时器轮询间隔：兼顾自动隐藏的灵敏度与半透明的快速重申（目标程序重置后能很快恢复）。
 pub const TIMER_INTERVAL_MS: u32 = 80;
 /// 周期性维护（刷新列表、回收失效目标、按记忆重新挂接）的最小间隔。
@@ -45,7 +54,26 @@ pub const WM_PICK_CANCEL: u32 = WM_APP + 6;
 /// 鼠标钩子触发老板键“隐藏 / 显示”（隐藏键与显示键不同时）的回调消息。
 pub const WM_BOSS_HIDE: u32 = WM_APP + 7;
 pub const WM_BOSS_SHOW: u32 = WM_APP + 8;
+/// 鼠标老板键抬起（“按住显示”据此在松开时隐藏）。
+pub const WM_BOSS_RELEASE: u32 = WM_APP + 9;
+/// 默认输出设备变化（耳机断开检测）。
+pub const WM_AUDIO_DEVICE: u32 = WM_APP + 10;
+/// Alt+滚轮调节不透明度，wParam 为滚动量。
+pub const WM_WHEEL_OPACITY: u32 = WM_APP + 11;
 pub const TRAY_UID: u32 = 1;
+/// Alt+滚轮每格调节的不透明度（百分点）。
+const WHEEL_OPACITY_STEP: i32 = 5;
+/// 摸鱼统计每累计这么多秒写一次盘。
+const STATS_SAVE_SECS: u64 = 60;
+
+/// 触发老板键的按键来源（“按住显示”需要知道松开的是哪个键）。
+#[derive(Clone, Copy, PartialEq)]
+pub enum KeySource {
+    /// 键盘热键，携带主键虚拟键码。
+    Key(u32),
+    /// 鼠标按键（松开时由钩子通知）。
+    Mouse,
+}
 
 /// 一个受管窗口及其自动隐藏 / 透明度的运行时状态。
 pub struct Target {
@@ -182,6 +210,32 @@ pub struct App {
     /// 正在以新形态重启自己（切换进程伪装开关时置位）：退出清理时
     /// 不恢复被隐藏 / 半透明的窗口，由接棒的下一个进程重新接管。
     relaunching: bool,
+    /// “按住显示”进行中：触发它的按键。
+    peeking: Option<KeySource>,
+    /// 老板键隐藏期间持续静音受管程序（新出现的音频会话也会补上）。
+    mute_active: bool,
+    /// 最近一次位于前台的非受管普通窗口（“切回工作窗口”的目标）。
+    last_work: isize,
+    /// 上一轮看到的前台窗口，用于只在前台变化时做判定。
+    last_fg: isize,
+    /// 光标离开屏幕角后才允许再次触发，避免停在角落时反复触发。
+    corner_armed: bool,
+    /// 会话是否锁定。
+    locked: bool,
+    /// 显示器是否亮着。
+    display_on: bool,
+    /// 激活的显示输出数（接投影检测）。
+    display_paths: u32,
+    /// 默认输出设备：(设备 ID, 是否耳机)。
+    output: Option<(String, bool)>,
+    /// 摸鱼统计：不足一秒的累计毫秒数。
+    stats_ms: u64,
+    /// 摸鱼统计：上一轮计时的时间点。
+    stats_tick: Option<Instant>,
+    /// 摸鱼统计：上次写盘时的秒数。
+    stats_saved: u64,
+    /// 上次显示的统计文本（变化时刷新托盘提示与界面）。
+    stats_shown: String,
 }
 
 impl App {
@@ -189,6 +243,7 @@ impl App {
         let cfg = Config::load();
         let dpi = win::dpi_for(hwnd);
         let icon = win::icon::load(win::icon::IconSize::Small);
+        let stats_saved = cfg.stats_secs;
         let mut app = App {
             hwnd,
             cfg,
@@ -205,13 +260,79 @@ impl App {
             overlay: win::overlay::Overlay::new(),
             last_maintenance: None,
             relaunching: false,
+            peeking: None,
+            mute_active: false,
+            last_work: 0,
+            last_fg: 0,
+            corner_armed: false,
+            locked: false,
+            display_on: true,
+            display_paths: watch::active_display_paths(),
+            output: None,
+            stats_ms: 0,
+            stats_tick: None,
+            stats_saved,
+            stats_shown: String::new(),
         };
-        app.refresh_windows();
-        app.reattach_remembered();
+        app.recover();
         app
     }
 
-    /// 窗口创建后初始化运行时资源：热键、定时器、托盘。
+    /// 启动时接管上次运行留下的现场（见 [`crate::recovery`]）。
+    ///
+    /// 上次被强制结束 / 切换伪装接力重启时，窗口可能仍处于隐藏、半透明或静音状态：
+    /// 能对应到记忆项的隐藏窗口重新接管为受管且保持隐藏，其余的一律复原。
+    fn recover(&mut self) {
+        let rec = crate::recovery::load();
+        audio::unmute_exes(&rec.muted);
+
+        let mut adopted = false;
+        for e in &rec.hidden {
+            if !e.is_same_window() || window::is_visible(e.hwnd) {
+                continue;
+            }
+            let title = window::title_of(e.hwnd);
+            let exe = window::process_name(e.hwnd);
+            let rt = self
+                .cfg
+                .remembered_targets
+                .iter()
+                .filter(|rt| !self.targets.iter().any(|t| same_remembered(&t.remembered, rt)))
+                .map(|rt| (match_score(&exe, &e.class, &title, rt), rt))
+                .filter(|(s, _)| *s > 0)
+                .max_by_key(|(s, _)| *s)
+                .map(|(_, rt)| rt.clone());
+            match rt {
+                Some(rt) => {
+                    let mut t = Target::new(e.hwnd, title);
+                    t.remembered = rt;
+                    t.hidden_by_us = true;
+                    window::register_hidden(e.hwnd);
+                    self.targets.push(t);
+                    adopted = true;
+                }
+                None => window::show_no_activate(e.hwnd),
+            }
+        }
+        if adopted {
+            self.all_hidden = true;
+            if self.cfg.mute_on_hide {
+                self.mute_targets();
+            }
+        }
+
+        self.refresh_windows();
+        self.reattach_remembered();
+
+        for e in &rec.styled {
+            if e.is_same_window() && !(self.cfg.transparency_enabled && self.is_managed(e.hwnd)) {
+                window::clear_opacity(e.hwnd);
+            }
+        }
+        crate::recovery::persist();
+    }
+
+    /// 窗口创建后初始化运行时资源：热键、定时器、托盘、系统事件监视。
     pub fn on_create(&mut self) {
         // 注册老板键（记录是否成功，失败一般是与其它软件热键冲突）。
         self.reapply_hotkeys();
@@ -219,17 +340,31 @@ impl App {
         unsafe {
             SetTimer(self.hwnd, TIMER_ID, TIMER_INTERVAL_MS, None);
         }
-        // 创建托盘图标。
+        if self.cfg.tray_icon {
+            self.create_tray();
+        }
+        watch::register(self.hwnd);
+        if self.cfg.hide_on_headphones {
+            self.watch_output(true);
+        }
+        // 若启用了半透明，初始应用到已恢复的受管窗口。
+        if self.cfg.transparency_enabled {
+            self.apply_opacity_all();
+        }
+        self.sync_wheel_hook();
+        if self.cfg.stats {
+            self.roll_stats_day();
+        }
+        self.update_tray_tip();
+    }
+
+    fn create_tray(&mut self) {
         let tip = if win::disguise::is_disguised() {
             "双击打开设置，右键菜单"
         } else {
             "BetterBossKey — 双击打开，右键菜单"
         };
         self.tray = Some(Tray::new(self.hwnd, TRAY_UID, WM_TRAYICON, self.icon, tip));
-        // 若启用了半透明，初始应用到已恢复的受管窗口。
-        if self.cfg.transparency_enabled {
-            self.apply_opacity_all();
-        }
     }
 
     // —— 窗口列表 / 受管集合 ——
@@ -378,6 +513,17 @@ impl App {
         self.cfg.save();
         // 立即刷新列表，使刚取消的（可能刚被恢复显示的）窗口即时回到“可选组”。
         self.refresh_windows();
+        self.targets_changed();
+    }
+
+    /// 受管集合变化后同步依赖它的状态：滚轮钩子的目标、静音范围。
+    fn targets_changed(&mut self) {
+        self.sync_wheel_hook();
+        if self.mute_active {
+            // 重新计算静音范围：被移出的程序恢复声音，其余保持静音。
+            audio::unmute_all();
+            self.mute_targets();
+        }
     }
 
     /// 直接删除某条记忆项（用于取消一个“已选中但当前未运行”的离线项）。
@@ -407,6 +553,7 @@ impl App {
             self.targets.remove(pos);
         }
         self.cfg.save();
+        self.targets_changed();
     }
 
     /// 构建窗口列表的行数据（供 GUI 布局 / 绘制使用）。
@@ -487,10 +634,7 @@ impl App {
 
     /// 老板键切换：有任一受管窗口可见就全部隐藏；否则全部恢复。
     pub fn boss_key_toggle(&mut self) {
-        let any_visible = self
-            .targets
-            .iter()
-            .any(|t| target_live(t) && window::is_visible(t.hwnd));
+        let any_visible = self.any_visible();
         if any_visible {
             self.hide_all();
         } else {
@@ -499,7 +643,90 @@ impl App {
         self.update_tray_tip();
     }
 
+    fn any_visible(&self) -> bool {
+        self.targets
+            .iter()
+            .any(|t| target_live(t) && window::is_visible(t.hwnd))
+    }
+
+    /// 隐藏键按下。
+    pub fn on_hide_key(&mut self) {
+        self.peeking = None;
+        self.hide_all();
+        self.update_tray_tip();
+    }
+
+    /// 显示键按下（隐藏键与显示键不同时）。
+    pub fn on_show_key(&mut self, src: KeySource) {
+        if self.cfg.peek {
+            self.begin_peek(src);
+        } else {
+            self.show_all();
+            self.update_tray_tip();
+        }
+    }
+
+    /// 切换键按下（隐藏键与显示键相同时）。开启“按住显示”后，它只负责按住显示。
+    pub fn on_toggle_key(&mut self, src: KeySource) {
+        if self.cfg.peek {
+            self.begin_peek(src);
+        } else {
+            self.boss_key_toggle();
+        }
+    }
+
+    /// 按住显示：显示但不抢焦点（只是看一眼），松开按键时再隐藏。
+    fn begin_peek(&mut self, src: KeySource) {
+        if self.peeking.is_some() {
+            return;
+        }
+        self.show_all_with(false);
+        self.peeking = Some(src);
+        if let KeySource::Key(_) = src {
+            // RegisterHotKey 不报告松开，改为快速轮询按键状态。
+            unsafe {
+                SetTimer(self.hwnd, PEEK_TIMER_ID, PEEK_POLL_MS, None);
+            }
+        }
+        self.update_tray_tip();
+    }
+
+    fn end_peek(&mut self) {
+        if self.peeking.take().is_none() {
+            return;
+        }
+        unsafe {
+            KillTimer(self.hwnd, PEEK_TIMER_ID);
+        }
+        self.hide_all();
+        self.update_tray_tip();
+        self.invalidate();
+    }
+
+    /// 轮询键盘老板键是否已松开。
+    pub fn on_peek_timer(&mut self) {
+        match self.peeking {
+            Some(KeySource::Key(vk)) if !key_down(vk as i32) => self.end_peek(),
+            Some(KeySource::Key(_)) => {}
+            _ => unsafe {
+                KillTimer(self.hwnd, PEEK_TIMER_ID);
+            },
+        }
+    }
+
+    /// 鼠标老板键松开。
+    pub fn on_mouse_key_release(&mut self) {
+        if self.peeking == Some(KeySource::Mouse) {
+            self.end_peek();
+        }
+    }
+
     pub fn hide_all(&mut self) {
+        self.hide_all_with(self.cfg.mute_on_hide);
+    }
+
+    fn hide_all_with(&mut self, mute: bool) {
+        let was_visible = self.any_visible();
         for t in &mut self.targets {
             if target_live(t) {
                 window::hide(t.hwnd);
@@ -510,12 +737,28 @@ impl App {
             t.hidden_rect = None;
         }
         self.all_hidden = true;
+        if mute {
+            self.mute_targets();
+        }
+        if self.cfg.cover && was_visible {
+            self.activate_cover();
+        }
     }
 
     pub fn show_all(&mut self) {
+        self.peeking = None;
+        self.show_all_with(true);
+    }
+
+    /// `activate`：是否把窗口切到前台（按住显示时不抢焦点）。
+    fn show_all_with(&mut self, activate: bool) {
         for t in &mut self.targets {
             if target_live(t) {
-                window::show(t.hwnd);
+                if activate {
+                    window::show(t.hwnd);
+                } else {
+                    window::show_no_activate(t.hwnd);
+                }
             }
             t.hidden_by_us = false;
             // 恢复后重置所有隐藏 / 自动隐藏状态：需重新进入窗口才会再次触发。
@@ -525,6 +768,186 @@ impl App {
             t.left_at = None;
         }
         self.all_hidden = false;
+        self.unmute();
+    }
+
+    /// 自动隐藏条件（屏幕角、离开、接投影、耳机断开）触发：等同于按一次“全部隐藏”。
+    /// `mute` 为 true 时无论“隐藏时静音”是否开启都静音（耳机断开时声音会外放）。
+    fn trigger_hide(&mut self, mute: bool) {
+        if self.picking || !self.targets.iter().any(target_live) {
+            return;
+        }
+        self.peeking = None;
+        unsafe {
+            KillTimer(self.hwnd, PEEK_TIMER_ID);
+        }
+        self.hide_all_with(self.cfg.mute_on_hide || mute);
+        self.update_tray_tip();
+        self.invalidate();
+    }
+
+    fn invalidate(&self) {
+        unsafe {
+            InvalidateRect(self.hwnd, std::ptr::null(), 0);
+        }
+    }
+
+    // —— 隐藏时静音 / 切回工作窗口 ——
+
+    /// 静音所有受管程序，并在隐藏期间持续补上新出现的音频会话。
+    fn mute_targets(&mut self) {
+        let mut exes: Vec<String> = Vec::new();
+        for t in self.targets.iter().filter(|t| target_live(t)) {
+            if !t.exe.is_empty() && !exes.iter().any(|e| e.eq_ignore_ascii_case(&t.exe)) {
+                exes.push(t.exe.clone());
+            }
+        }
+        audio::mute(&exes);
+        self.mute_active = true;
+    }
+
+    fn unmute(&mut self) {
+        self.mute_active = false;
+        audio::unmute_all();
+    }
+
+    pub fn set_mute_on_hide(&mut self, on: bool) {
+        self.cfg.mute_on_hide = on;
+        if on && self.all_hidden {
+            self.mute_targets();
+        } else if !on {
+            self.unmute();
+        }
+        self.cfg.save();
+    }
+
+    pub fn set_cover(&mut self, on: bool) {
+        self.cfg.cover = on;
+        self.last_fg = 0;
+        self.cfg.save();
+    }
+
+    /// 记录最近位于前台的非受管普通窗口。
+    fn track_work_window(&mut self) {
+        let fg = window::foreground();
+        if fg == self.last_fg {
+            return;
+        }
+        self.last_fg = fg;
+        if fg != self.hwnd as isize && !self.is_managed(fg) && window::is_switchable(fg) {
+            self.last_work = fg;
+        }
+    }
+
+    /// 把最近使用的工作窗口切到前台。
+    fn activate_cover(&mut self) {
+        let h = self.last_work;
+        if h != 0 && !self.is_managed(h) && window::is_alive(h) && window::is_visible(h) {
+            window::activate(h);
+            self.last_fg = h;
+        }
+    }
+
+    // —— 自动隐藏条件 ——
+
+    pub fn set_corner(&mut self, corner: u8) {
+        self.cfg.corner = corner.min(4);
+        self.corner_armed = false; // 光标先离开角落才生效，避免选中当下就触发
+        self.cfg.save();
+    }
+
+    pub fn set_hide_on_away(&mut self, on: bool) {
+        self.cfg.hide_on_away = on;
+        self.cfg.save();
+    }
+
+    pub fn set_hide_on_projector(&mut self, on: bool) {
+        self.cfg.hide_on_projector = on;
+        self.display_paths = watch::active_display_paths();
+        self.cfg.save();
+    }
+
+    pub fn set_hide_on_headphones(&mut self, on: bool) {
+        self.cfg.hide_on_headphones = on;
+        self.watch_output(on);
+        self.cfg.save();
+    }
+
+    fn watch_output(&mut self, on: bool) {
+        if on {
+            audio::watch_default_output(self.hwnd, WM_AUDIO_DEVICE);
+            self.output = audio::default_output();
+        } else {
+            audio::unwatch_default_output();
+            self.output = None;
+        }
+    }
+
+    /// 锁屏 / 解锁通知。
+    pub fn on_session_change(&mut self, event: usize) {
+        match event {
+            watch::WTS_SESSION_LOCK => {
+                self.locked = true;
+                if self.cfg.hide_on_away {
+                    self.trigger_hide(false);
+                }
+            }
+            watch::WTS_SESSION_UNLOCK => self.locked = false,
+            _ => {}
+        }
+    }
+
+    /// 电源通知：显示器熄灭时隐藏。
+    pub fn on_power(&mut self, wparam: usize, lparam: LPARAM) {
+        if let Some(on) = watch::display_state(wparam, lparam) {
+            let turned_off = self.display_on && !on;
+            self.display_on = on;
+            if turned_off && self.cfg.hide_on_away {
+                self.trigger_hide(false);
+            }
+        }
+    }
+
+    /// 显示配置变化（WM_DISPLAYCHANGE 及周期维护）：激活的输出变多即视为接了投影。
+    pub fn check_displays(&mut self) {
+        let n = watch::active_display_paths();
+        if n == 0 {
+            return;
+        }
+        let more = self.display_paths != 0 && n > self.display_paths;
+        self.display_paths = n;
+        if more && self.cfg.hide_on_projector {
+            self.trigger_hide(false);
+        }
+    }
+
+    /// 默认输出设备变化：从耳机切走即视为耳机断开。
+    pub fn on_output_changed(&mut self) {
+        if !self.cfg.hide_on_headphones {
+            return;
+        }
+        let now = audio::default_output();
+        let prev = std::mem::replace(&mut self.output, now);
+        if let Some((prev_id, was_headphones)) = prev {
+            let changed = self.output.as_ref().is_none_or(|(id, _)| *id != prev_id);
+            if changed && was_headphones {
+                self.trigger_hide(true);
+            }
+        }
+    }
+
+    /// 屏幕角：光标进入所选角落时触发一次。
+    fn check_corner(&mut self, cursor: POINT) {
+        if self.cfg.corner == 0 {
+            return;
+        }
+        let at = watch::at_corner(cursor, self.cfg.corner);
+        if at && self.corner_armed {
+            self.corner_armed = false;
+            self.trigger_hide(false);
+        } else if !at {
+            self.corner_armed = true;
+        }
     }
 
     // —— 半透明 ——
@@ -565,7 +988,147 @@ impl App {
         } else {
             self.clear_opacity_all();
         }
+        self.sync_wheel_hook();
         self.cfg.save();
+    }
+
+    pub fn set_click_through(&mut self, on: bool) {
+        self.cfg.click_through = on;
+        if !on {
+            for t in self.targets.iter().filter(|t| target_live(t)) {
+                window::set_click_through(t.hwnd, false);
+            }
+        }
+        self.cfg.save();
+    }
+
+    pub fn set_wheel_opacity(&mut self, on: bool) {
+        self.cfg.wheel_opacity = on;
+        self.sync_wheel_hook();
+        self.cfg.save();
+    }
+
+    /// 按配置安装 / 卸载 Alt+滚轮钩子，并同步它的目标窗口。
+    fn sync_wheel_hook(&self) {
+        if self.cfg.transparency_enabled && self.cfg.wheel_opacity {
+            mouse_hook::install_wheel(self.hwnd, WM_WHEEL_OPACITY);
+            mouse_hook::set_wheel_targets(
+                self.targets.iter().filter(|t| target_live(t)).map(|t| t.hwnd).collect(),
+            );
+        } else {
+            mouse_hook::uninstall_wheel();
+        }
+    }
+
+    /// Alt+滚轮：向上滚更不透明，向下滚更透明。
+    pub fn on_wheel_opacity(&mut self, delta: i32) {
+        if !self.cfg.transparency_enabled {
+            return;
+        }
+        let notches = if delta.abs() >= 120 { delta / 120 } else { delta.signum() };
+        let p = (self.cfg.opacity as i32 + notches * WHEEL_OPACITY_STEP)
+            .clamp(MIN_OPACITY as i32, MAX_OPACITY as i32);
+        self.set_opacity_percent(p as u8);
+        // 吞掉了滚轮，目标程序只看到单独的 Alt 按下 / 松开，会激活其菜单栏。
+        if key_down(0x12) {
+            mouse_hook::suppress_alt_menu();
+        }
+    }
+
+    // —— 托盘 / 摸鱼统计 ——
+
+    pub fn set_tray_icon(&mut self, on: bool) {
+        self.cfg.tray_icon = on;
+        if on {
+            self.create_tray();
+            self.update_tray_tip();
+        } else {
+            self.tray = None;
+        }
+        self.cfg.save();
+    }
+
+    pub fn set_stats(&mut self, on: bool) {
+        self.cfg.stats = on;
+        self.stats_tick = None;
+        self.stats_ms = 0;
+        if on {
+            self.roll_stats_day();
+        }
+        self.stats_shown = self.stats_text();
+        self.cfg.save();
+        self.stats_saved = self.cfg.stats_secs;
+        self.update_tray_tip();
+    }
+
+    /// 日期变了就清零。
+    fn roll_stats_day(&mut self) {
+        let today = today();
+        if self.cfg.stats_day != today {
+            self.cfg.stats_day = today;
+            self.cfg.stats_secs = 0;
+            self.stats_ms = 0;
+            self.stats_saved = 0;
+            self.cfg.save();
+        }
+    }
+
+    /// 计时：受管窗口有任一可见（未最小化）、且未锁屏、显示器亮着。
+    fn tick_stats(&mut self) {
+        let now = Instant::now();
+        let prev = self.stats_tick.replace(now);
+        let counting = !self.locked
+            && self.display_on
+            && self.targets.iter().any(|t| {
+                target_live(t) && window::is_visible(t.hwnd) && !window::is_minimized(t.hwnd)
+            });
+        if let (true, Some(prev)) = (counting, prev) {
+            // 封顶一秒：系统睡眠唤醒后两次定时器之间可能隔了很久。
+            self.stats_ms += (now - prev).as_millis().min(1000) as u64;
+            self.cfg.stats_secs += self.stats_ms / 1000;
+            self.stats_ms %= 1000;
+        }
+    }
+
+    /// 界面与托盘显示的今日时长与摸鱼工资，如 `今日 1h05m · ¥54.17`；未开启统计时为空。
+    pub fn stats_text(&self) -> String {
+        if !self.cfg.stats {
+            return String::new();
+        }
+        let m = self.cfg.stats_secs / 60;
+        let mut s = if m >= 60 {
+            format!("今日 {}h{:02}m", m / 60, m % 60)
+        } else {
+            format!("今日 {m}m")
+        };
+        if let Some(wage) = Wage::parse(&self.cfg.wage) {
+            s.push_str(" · ");
+            s.push_str(&wage.earned(self.cfg.stats_secs));
+        }
+        s
+    }
+
+    /// 设置时薪。空串表示不计算金额；无法解析的输入保持原值不变。
+    /// 只填了数字时补上默认货币符号，让输入框显示出金额的单位。
+    pub fn set_wage(&mut self, raw: &str) {
+        let raw = raw.trim();
+        let wage = if raw.is_empty() {
+            String::new()
+        } else if Wage::parse(raw).is_some() {
+            if raw.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                format!("{DEFAULT_CURRENCY}{raw}")
+            } else {
+                raw.to_string()
+            }
+        } else {
+            return;
+        };
+        if wage != self.cfg.wage {
+            self.cfg.wage = wage;
+            self.cfg.save();
+            self.stats_shown = self.stats_text();
+            self.update_tray_tip();
+        }
     }
 
     // —— 自动隐藏 ——
@@ -740,17 +1303,17 @@ impl App {
             self.last_maintenance = Some(Instant::now());
             if self.maintenance_tick() {
                 self.update_tray_tip();
-                unsafe {
-                    InvalidateRect(self.hwnd, std::ptr::null(), 0);
-                }
+                self.invalidate();
             }
         }
 
         // ① 重申半透明。部分程序（自渲染 / 投屏 / 视频类窗口，如 phoneCast）会在重绘、
         //    获得焦点或鼠标移入时重置分层窗口属性，把我们设的透明度冲掉。由于我们只在
-        //    设置那一刻施加一次，必须周期性重新施加才能稳定保持透明。
+        //    设置那一刻施加一次，必须周期性重新施加才能稳定保持透明。鼠标穿透同理，
+        //    并在按住 Ctrl 时暂停，以便直接操作该窗口。
         if self.cfg.transparency_enabled {
             let alpha = opacity_to_alpha(self.cfg.opacity);
+            let through = self.cfg.click_through && !key_down(0x11);
             for t in &self.targets {
                 if t.opacity_applied
                     && !t.hidden_by_us
@@ -758,15 +1321,26 @@ impl App {
                     && window::is_visible(t.hwnd)
                 {
                     window::set_opacity(t.hwnd, alpha);
+                    if self.cfg.click_through {
+                        window::set_click_through(t.hwnd, through);
+                    }
                 }
             }
         }
+
+        if self.cfg.cover {
+            self.track_work_window();
+        }
+        if self.cfg.stats {
+            self.tick_stats();
+        }
+        let cursor = cursor_pos();
+        self.check_corner(cursor);
 
         // ② 自动隐藏。
         if !self.cfg.auto_hide || self.all_hidden {
             return;
         }
-        let cursor = cursor_pos();
         let delay = self.cfg.auto_hide_delay_ms;
         let reveal_delay = self.cfg.reveal_delay_ms;
         let auto_focus = self.cfg.auto_focus;
@@ -893,7 +1467,7 @@ impl App {
             }
         }
 
-        if !bindings.is_empty() && !mouse_hook::install(self.hwnd, &bindings) {
+        if !bindings.is_empty() && !mouse_hook::install(self.hwnd, &bindings, WM_BOSS_RELEASE) {
             // 鼠标钩子装不上：相关的鼠标槽位标记为失败。
             if matches!(self.cfg.hide_hotkey, Hotkey::Mouse { .. }) {
                 hide_ok = false;
@@ -970,20 +1544,34 @@ impl App {
         }
     }
 
+    /// 开 / 关“按住显示”。
+    pub fn set_peek(&mut self, on: bool) {
+        self.cfg.peek = on;
+        self.cfg.save();
+    }
+
     // —— 托盘 ——
 
     pub fn update_tray_tip(&mut self) {
+        if self.tray.is_none() {
+            return;
+        }
         let managed = self.targets.len();
         let hidden = self
             .targets
             .iter()
             .filter(|t| target_live(t) && !window::is_visible(t.hwnd))
             .count();
-        let tip = if win::disguise::is_disguised() {
+        let mut tip = if win::disguise::is_disguised() {
             format!("管理 {managed} 个窗口，已隐藏 {hidden} 个")
         } else {
             format!("BetterBossKey — 管理 {managed} 个窗口，已隐藏 {hidden} 个")
         };
+        let stats = self.stats_text();
+        if !stats.is_empty() {
+            tip.push_str(" · ");
+            tip.push_str(&stats);
+        }
         if let Some(tray) = &mut self.tray {
             tray.set_tip(&tip);
         }
@@ -991,8 +1579,8 @@ impl App {
 
     // —— 周期性维护 ——
 
-    /// 刷新窗口列表、回收失效目标、按记忆重新挂接。返回界面是否需要重绘
-    /// （列表内容或受管数量发生了变化）。
+    /// 刷新窗口列表、回收失效目标、按记忆重新挂接，并处理各项低频检查。
+    /// 返回界面是否需要重绘（列表内容、受管数量或统计时长发生了变化）。
     fn maintenance_tick(&mut self) -> bool {
         let before: Vec<(isize, String)> =
             self.window_list.iter().map(|w| (w.hwnd, w.title.clone())).collect();
@@ -1003,27 +1591,63 @@ impl App {
         if self.targets.len() < self.cfg.remembered_targets.len() {
             self.reattach_remembered();
         }
+        if before_targets != self.targets.len() {
+            self.sync_wheel_hook();
+        }
+        // 隐藏期间新出现的音频会话（如重新开始播放）也要静音。
+        if self.mute_active && self.all_hidden {
+            self.mute_targets();
+        }
+        if self.cfg.hide_on_projector {
+            self.check_displays();
+        }
+
+        let mut stats_changed = false;
+        if self.cfg.stats {
+            self.roll_stats_day();
+            if self.cfg.stats_secs >= self.stats_saved + STATS_SAVE_SECS {
+                self.stats_saved = self.cfg.stats_secs;
+                self.cfg.save();
+            }
+            let text = self.stats_text();
+            if text != self.stats_shown {
+                self.stats_shown = text;
+                stats_changed = true;
+            }
+        }
+
         let after: Vec<(isize, String)> =
             self.window_list.iter().map(|w| (w.hwnd, w.title.clone())).collect();
-        before != after || before_targets != self.targets.len()
+        before != after || before_targets != self.targets.len() || stats_changed
     }
 
-    /// 退出前的清理：恢复所有被我们隐藏 / 半透明的窗口，释放资源。
+    /// 退出前的清理：恢复所有被我们隐藏 / 半透明 / 静音的窗口，释放资源。
     /// 重启接力（`relaunching`）时跳过恢复——窗口保持现状，由下一个进程接管。
     pub fn cleanup(&mut self) {
+        self.peeking = None;
         for t in &self.targets {
             if target_live(t) && t.opacity_applied && !self.relaunching {
                 window::clear_opacity(t.hwnd);
             }
         }
         if !self.relaunching {
-            // 兜底：恢复所有登记在册的隐藏窗口（含 identity 校验可能跳过的）。
+            // 兜底：恢复所有登记在册的隐藏 / 半透明窗口（含 identity 校验可能跳过的）。
             window::restore_all_hidden();
+            window::restore_all_styled();
+            audio::unmute_all();
+        }
+        if self.cfg.stats {
+            self.cfg.save();
         }
         self.clear_hotkeys();
+        mouse_hook::uninstall_wheel();
+        audio::unwatch_default_output();
+        watch::unregister(self.hwnd);
         unsafe {
             KillTimer(self.hwnd, TIMER_ID);
+            KillTimer(self.hwnd, PEEK_TIMER_ID);
         }
+        crate::recovery::persist();
         self.tray = None; // Drop -> 移除托盘图标
         self.overlay.destroy();
         self.ui.fonts.destroy();
@@ -1033,6 +1657,20 @@ impl App {
             }
         }
     }
+}
+
+/// 某个按键当前是否按下。
+fn key_down(vk: i32) -> bool {
+    unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
+}
+
+/// 今天的本地日期，形如 20261109。
+fn today() -> u32 {
+    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe {
+        GetLocalTime(&mut st);
+    }
+    st.wYear as u32 * 10000 + st.wMonth as u32 * 100 + st.wDay as u32
 }
 
 /// 百分比不透明度 -> alpha(0..255)。

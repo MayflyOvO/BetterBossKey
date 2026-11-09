@@ -6,10 +6,10 @@
 
 use std::cell::Cell;
 
-use windows_sys::Win32::Foundation::RECT;
+use windows_sys::Win32::Foundation::{RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
-    DrawTextW, GdiFlush, IntersectClipRect, RestoreDC, SaveDC, SelectObject, SetBkMode,
-    SetTextColor, HDC, HFONT, TRANSPARENT,
+    DrawTextW, GdiFlush, GetTextExtentPoint32W, IntersectClipRect, RestoreDC, SaveDC,
+    SelectObject, SetBkMode, SetTextColor, HDC, HFONT, TRANSPARENT,
 };
 
 use crate::util::wide;
@@ -201,4 +201,16 @@ pub fn text(c: &Canvas, s: &str, r: &RECT, font: HFONT, color: u32, flags: u32) 
         DrawTextW(c.hdc, w.as_ptr(), -1, &mut rc, flags);
         SelectObject(c.hdc, old); // 还原原字体，与其它原语保持一致
     }
+}
+
+/// 单行文本的绘制宽度（像素）。
+pub fn text_width(c: &Canvas, s: &str, font: HFONT) -> i32 {
+    let w: Vec<u16> = s.encode_utf16().collect();
+    let mut size = SIZE { cx: 0, cy: 0 };
+    unsafe {
+        let old = SelectObject(c.hdc, font);
+        GetTextExtentPoint32W(c.hdc, w.as_ptr(), w.len() as i32, &mut size);
+        SelectObject(c.hdc, old);
+    }
+    size.cx
 }

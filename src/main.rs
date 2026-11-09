@@ -11,6 +11,7 @@
 mod app;
 mod config;
 mod gui;
+mod recovery;
 mod util;
 mod win;
 
@@ -23,6 +24,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     InvalidateRect, SelectObject, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     DIB_RGB_COLORS, PAINTSTRUCT, SRCCOPY,
 };
+use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{CreateMutexW, Sleep};
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -39,22 +41,26 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, MF_SEPARATOR, MF_STRING,
     MSG, SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SWP_SHOWWINDOW, TPM_LEFTALIGN,
-    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
-    WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED,
+    WM_ENDSESSION, WM_ERASEBKGND, WM_CHAR, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER,
     WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_MINIMIZEBOX, WS_SYSMENU,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{WA_INACTIVE, WM_ACTIVATE};
 
 use crate::app::{
-    App, HOTKEY_ID_HIDE, HOTKEY_ID_SHOW, HOTKEY_ID_TOGGLE, TIMER_ID, WM_BOSS_HIDE, WM_BOSS_SHOW,
-    WM_MOUSE_HOTKEY, WM_PICK_CANCEL, WM_PICK_MOVE, WM_PICK_SELECT, WM_TRAYICON,
+    App, KeySource, HOTKEY_ID_HIDE, HOTKEY_ID_SHOW, HOTKEY_ID_TOGGLE, PEEK_TIMER_ID, TIMER_ID,
+    WM_AUDIO_DEVICE, WM_BOSS_HIDE, WM_BOSS_RELEASE, WM_BOSS_SHOW, WM_MOUSE_HOTKEY, WM_PICK_CANCEL,
+    WM_PICK_MOVE, WM_PICK_SELECT, WM_TRAYICON, WM_WHEEL_OPACITY,
 };
 use crate::config::Config;
 use crate::gui::widgets::Canvas;
 use crate::util::wide;
-use crate::win::hotkey::MouseButton;
+use crate::win::hotkey::{Hotkey, MouseButton};
 use crate::win::icon::IconSize;
+use crate::win::watch;
 use crate::win::window::APP_WINDOW_CLASS;
 
 /// 从另一个实例 / 托盘请求显示设置窗口的自定义消息。
@@ -96,11 +102,12 @@ fn acquire_single_instance(wait: bool) -> bool {
 }
 
 fn main() {
-    // 即使发生 panic（abort 之前），也尽力恢复被隐藏的窗口，避免用户窗口永久消失。
+    // 即使发生 panic（abort 之前），也尽力恢复被隐藏 / 半透明的窗口，避免用户窗口永久消失。
     // 链式调用原 hook，保留 panic 信息打印。
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         crate::win::window::restore_all_hidden();
+        crate::win::window::restore_all_styled();
         default_hook(info);
     }));
 
@@ -141,6 +148,8 @@ fn main() {
         }
 
         let hinst = GetModuleHandleW(std::ptr::null());
+        // 音频功能（静音 / 耳机检测）用到的 Core Audio 是 COM 接口。
+        CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
         let icon_large = win::icon::load(IconSize::Large);
         let icon_small = win::icon::load(IconSize::Small);
 
@@ -407,6 +416,13 @@ unsafe extern "system" fn wndproc(
             }
             0
         }
+        WM_CHAR => {
+            let ptr = app_from(hwnd);
+            if !ptr.is_null() && (*ptr).on_char(wparam as u32) {
+                invalidate(hwnd);
+            }
+            0
+        }
         WM_SYSKEYDOWN => {
             // Alt+键、F10 走 WM_SYSKEYDOWN：录制中同样交给热键录制，并吞掉以免激活系统菜单。
             let ptr = app_from(hwnd);
@@ -419,34 +435,40 @@ unsafe extern "system" fn wndproc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_ACTIVATE => {
-            // 失去激活（切走 / 关到托盘）时结束录制，避免老板键一直处于暂停状态。
+            // 失去激活（切走 / 关到托盘）时结束录制，避免老板键一直处于暂停状态；
+            // 时薪编辑则按确认处理。
             let ptr = app_from(hwnd);
-            if !ptr.is_null() && (wparam & 0xFFFF) as u32 == WA_INACTIVE && (*ptr).ui.capturing_hotkey.is_some() {
-                (*ptr).end_hotkey_capture(None);
-                invalidate(hwnd);
+            if !ptr.is_null() && (wparam & 0xFFFF) as u32 == WA_INACTIVE {
+                let app = &mut *ptr;
+                if app.ui.capturing_hotkey.is_some() || app.ui.editing_wage.is_some() {
+                    app.end_hotkey_capture(None);
+                    app.end_wage_edit(true);
+                    invalidate(hwnd);
+                }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_HOTKEY => {
             let ptr = app_from(hwnd);
             if !ptr.is_null() {
+                let app = &mut *ptr;
+                let vk_of = |hk: Hotkey| match hk {
+                    Hotkey::Key { vk, .. } => vk,
+                    Hotkey::Mouse { .. } => 0,
+                };
                 match wparam as i32 {
                     HOTKEY_ID_TOGGLE => {
-                        (*ptr).boss_key_toggle();
-                        invalidate(hwnd);
+                        let vk = vk_of(app.cfg.hide_hotkey);
+                        app.on_toggle_key(KeySource::Key(vk));
                     }
-                    HOTKEY_ID_HIDE => {
-                        (*ptr).hide_all();
-                        (*ptr).update_tray_tip();
-                        invalidate(hwnd);
-                    }
+                    HOTKEY_ID_HIDE => app.on_hide_key(),
                     HOTKEY_ID_SHOW => {
-                        (*ptr).show_all();
-                        (*ptr).update_tray_tip();
-                        invalidate(hwnd);
+                        let vk = vk_of(app.cfg.show_hotkey);
+                        app.on_show_key(KeySource::Key(vk));
                     }
                     _ => {}
                 }
+                invalidate(hwnd);
             }
             0
         }
@@ -454,7 +476,7 @@ unsafe extern "system" fn wndproc(
             // 鼠标钩子检测到“切换键”（隐藏键与显示键相同）。
             let ptr = app_from(hwnd);
             if !ptr.is_null() {
-                (*ptr).boss_key_toggle();
+                (*ptr).on_toggle_key(KeySource::Mouse);
                 invalidate(hwnd);
             }
             0
@@ -463,8 +485,7 @@ unsafe extern "system" fn wndproc(
             // 鼠标钩子检测到隐藏键（隐藏键与显示键不同）。
             let ptr = app_from(hwnd);
             if !ptr.is_null() {
-                (*ptr).hide_all();
-                (*ptr).update_tray_tip();
+                (*ptr).on_hide_key();
                 invalidate(hwnd);
             }
             0
@@ -473,16 +494,63 @@ unsafe extern "system" fn wndproc(
             // 鼠标钩子检测到显示键（隐藏键与显示键不同）。
             let ptr = app_from(hwnd);
             if !ptr.is_null() {
-                (*ptr).show_all();
-                (*ptr).update_tray_tip();
+                (*ptr).on_show_key(KeySource::Mouse);
                 invalidate(hwnd);
             }
             0
         }
+        WM_BOSS_RELEASE => {
+            let ptr = app_from(hwnd);
+            if !ptr.is_null() {
+                (*ptr).on_mouse_key_release();
+                invalidate(hwnd);
+            }
+            0
+        }
+        WM_WHEEL_OPACITY => {
+            let ptr = app_from(hwnd);
+            if !ptr.is_null() {
+                (*ptr).on_wheel_opacity(wparam as isize as i32);
+                invalidate(hwnd);
+            }
+            0
+        }
+        WM_AUDIO_DEVICE => {
+            let ptr = app_from(hwnd);
+            if !ptr.is_null() {
+                (*ptr).on_output_changed();
+            }
+            0
+        }
+        WM_DISPLAYCHANGE => {
+            let ptr = app_from(hwnd);
+            if !ptr.is_null() {
+                (*ptr).check_displays();
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        watch::WM_WTSSESSION_CHANGE => {
+            let ptr = app_from(hwnd);
+            if !ptr.is_null() {
+                (*ptr).on_session_change(wparam);
+            }
+            0
+        }
+        watch::WM_POWERBROADCAST => {
+            let ptr = app_from(hwnd);
+            if !ptr.is_null() {
+                (*ptr).on_power(wparam, lparam);
+            }
+            1 // TRUE：同意（仅对查询类事件有意义）
+        }
         WM_TIMER => {
             let ptr = app_from(hwnd);
-            if !ptr.is_null() && wparam == TIMER_ID {
-                (*ptr).on_timer();
+            if !ptr.is_null() {
+                match wparam {
+                    TIMER_ID => (*ptr).on_timer(),
+                    PEEK_TIMER_ID => (*ptr).on_peek_timer(),
+                    _ => {}
+                }
             }
             0
         }
@@ -570,6 +638,8 @@ unsafe extern "system" fn wndproc(
                     (*ptr).clear_opacity_all();
                 }
                 crate::win::window::restore_all_hidden();
+                crate::win::window::restore_all_styled();
+                crate::recovery::persist();
             }
             0
         }

@@ -5,10 +5,10 @@
 //! （双缓冲），由 `main.rs` 的 WM_PAINT 负责把结果一次性 BitBlt 到屏幕。
 //!
 //! 布局语法（让布局本身说明含义，不加标题 / 副标题 / 提示文字）：
-//! * 窗口列表卡片在最上方，卡片底部是“拾取窗口”。
+//! * 双栏：左栏是窗口列表卡片（底部“拾取窗口”）、老板键与操作按钮；右栏是各项设置。
 //! * 每项设置占一行：左侧标签，右侧控件；整行可点。
 //! * 依赖某开关的子项缩进排在其下，开关关闭时变暗且不可点击。
-//! * 分组之间只用细分隔线。
+//! * 分组之间只用细分隔线。文字只用于说明状态。
 //!
 //! 新增控件：在 [`Hot`] 加变体 → `compute_layout` 算出矩形并登记到 `hits`
 //! → `paint` 绘制 → `on_lbutton_down` 处理。命中测试无需改动。
@@ -27,19 +27,25 @@ use crate::win::scale;
 
 // 以下尺寸均为 96 DPI 下的逻辑像素，使用前经 `scale` 换算。
 /// 窗口客户区宽度。
-const LOGICAL_W: i32 = 440;
+const LOGICAL_W: i32 = 800;
 /// 外边距。
 const PAD: i32 = 20;
+/// 左右两栏之间的间距。
+const COL_GAP: i32 = 40;
 /// 窗口列表的行高。
 const LIST_ROW_H: i32 = 34;
-/// 窗口列表可视区显示的行数。
-const LIST_VISIBLE_ROWS: i32 = 5;
+/// 窗口列表至少显示的行数（列表高度随右栏伸展，不低于此值）。
+const LIST_MIN_ROWS: i32 = 5;
 /// 设置行的行高。
 const LINE_H: i32 = 36;
 /// 子项相对父开关的缩进。
 const INDENT: i32 = 16;
 /// 步进器每次增减的毫秒数。
 const DELAY_STEP_MS: u32 = 100;
+/// 点亮屏幕角开关时默认选用的角（右下，Windows“显示桌面”所在处）。
+const DEFAULT_CORNER: u8 = 4;
+/// 时薪输入框最多容纳的字符数。
+const WAGE_MAX_CHARS: usize = 12;
 
 const TEXT_FLAGS: u32 = w::DT_VCENTER | w::DT_SINGLELINE | w::DT_NOPREFIX;
 
@@ -50,15 +56,30 @@ pub enum Hot {
     Pick,
     HideKey,
     ShowKey,
+    Peek,
+    Stats,
+    Wage,
+    Mute,
+    Cover,
     AutoHide,
     DelayMinus,
     DelayPlus,
     RevealMinus,
     RevealPlus,
     AutoFocus,
+    /// 屏幕角整行（开 / 关）。
+    Corner,
+    /// 屏幕角选择器里的某个角（1 左上，2 右上，3 左下，4 右下）。
+    CornerAt(u8),
+    Away,
+    Projector,
+    Headphones,
     Opacity,
     Slider,
+    ClickThrough,
+    Wheel,
     Disguise,
+    Tray,
     HideAll,
     ShowAll,
     /// 列表中的第 N 行（`layout.rows` 下标，兼容已选中 / 离线 / 可选三类行）。
@@ -162,6 +183,9 @@ impl Stepper {
 }
 
 /// 一次布局计算的结果（物理像素）。绘制与命中测试共用。
+///
+/// 左栏：窗口列表卡片（含底部“拾取窗口”）、老板键、摸鱼统计、操作按钮；
+/// 右栏：隐藏时的动作、自动隐藏条件、半透明、隐蔽。
 pub struct Layout {
     pub height_needed: i32,
     /// 窗口列表卡片（含底部“拾取窗口”）。
@@ -174,16 +198,30 @@ pub struct Layout {
     pub list_inner_h: i32,
     pub hide_key: Field,
     pub show_key: Field,
+    pub peek: Field,
+    pub stats: Field,
+    pub wage: Field,
+    pub hide_btn: RECT,
+    pub show_btn: RECT,
+    pub mute: Field,
+    pub cover: Field,
     pub auto_hide: Field,
     pub hide_delay: Stepper,
     pub reveal_delay: Stepper,
     pub auto_focus: Field,
+    pub corner: Field,
+    /// 屏幕角选择器的四个角（左上、右上、左下、右下）。
+    pub corner_cells: [RECT; 4],
+    pub away: Field,
+    pub projector: Field,
+    pub headphones: Field,
     pub opacity: Field,
     pub slider_track: RECT,
+    pub click_through: Field,
+    pub wheel: Field,
     pub disguise: Field,
+    pub tray: Field,
     pub dividers: Vec<RECT>,
-    pub hide_btn: RECT,
-    pub show_btn: RECT,
     /// 当前可交互的区域，按命中优先级排列；禁用的控件不登记。
     pub hits: Vec<(RECT, Hot)>,
 }
@@ -200,16 +238,29 @@ impl Default for Layout {
             list_inner_h: 0,
             hide_key: Field::NONE,
             show_key: Field::NONE,
+            peek: Field::NONE,
+            stats: Field::NONE,
+            wage: Field::NONE,
+            hide_btn: ZERO,
+            show_btn: ZERO,
+            mute: Field::NONE,
+            cover: Field::NONE,
             auto_hide: Field::NONE,
             hide_delay: Stepper::NONE,
             reveal_delay: Stepper::NONE,
             auto_focus: Field::NONE,
+            corner: Field::NONE,
+            corner_cells: [ZERO; 4],
+            away: Field::NONE,
+            projector: Field::NONE,
+            headphones: Field::NONE,
             opacity: Field::NONE,
             slider_track: ZERO,
+            click_through: Field::NONE,
+            wheel: Field::NONE,
             disguise: Field::NONE,
+            tray: Field::NONE,
             dividers: Vec::new(),
-            hide_btn: ZERO,
-            show_btn: ZERO,
             hits: Vec::new(),
         }
     }
@@ -222,6 +273,10 @@ pub struct Ui {
     pub list_scroll: i32,
     /// 正在捕获热键的槽位（None = 未在捕获）。
     pub capturing_hotkey: Option<HkSlot>,
+    /// 正在编辑的时薪文本（None = 未在编辑）。
+    pub editing_wage: Option<String>,
+    /// 刚进入编辑、原文处于全选状态：输入的第一个字符替换整段。
+    pub wage_selected: bool,
     pub dragging_slider: bool,
     pub hover: Hot,
     pub layout: Layout,
@@ -234,6 +289,8 @@ impl Ui {
             fonts: Fonts::new(dpi),
             list_scroll: 0,
             capturing_hotkey: None,
+            editing_wage: None,
+            wage_selected: false,
             dragging_slider: false,
             hover: Hot::None,
             layout: Layout::default(),
@@ -278,35 +335,129 @@ fn intersect(a: &RECT, b: &RECT) -> Option<RECT> {
 
 impl App {
     /// 计算布局（width 为客户区物理宽度）。
+    ///
+    /// 先排右栏（设置项），它决定窗口高度；左栏的按钮与右栏底部对齐，
+    /// 窗口列表卡片伸展占满其余高度。
     pub fn compute_layout(&self, width: i32) -> Layout {
         let dpi = self.ui.dpi;
         let s = |v: i32| scale(v, dpi);
         let pad = s(PAD);
-        let (left, right) = (pad, width - pad);
-        let sub = left + s(INDENT);
+        let col_w = (width - 2 * pad - s(COL_GAP)) / 2;
+        let (ll, lr) = (pad, pad + col_w);
+        let (rl, rr) = (width - pad - col_w, width - pad);
         let line_h = s(LINE_H);
         let gap = s(4);
         let (tgl_w, tgl_h) = (s(46), s(26));
+        let div_h = s(1).max(1);
         let mut hits: Vec<(RECT, Hot)> = Vec::new();
         let mut dividers = Vec::new();
+        let divider = |y: &mut i32, l: i32, r: i32, out: &mut Vec<RECT>| {
+            *y += s(12);
+            out.push(rect(l, *y, r, *y + div_h));
+            *y += div_h + s(12);
+        };
+        // 开关行：从 y 开始放一行并下移；`last` 表示组内最后一行（不留行距）。
+        let toggle = |y: &mut i32, l: i32, r: i32, last: bool| {
+            let f = Field::new(l, r, *y, line_h, tgl_w, tgl_h);
+            *y += line_h + if last { 0 } else { gap };
+            f
+        };
+
+        // ======================= 右栏 =======================
+        let rsub = rl + s(INDENT);
         let mut y = pad;
+
+        // —— 隐藏时的动作 ——
+        let mute = toggle(&mut y, rl, rr, false);
+        let cover = toggle(&mut y, rl, rr, true);
+        hits.push((mute.row, Hot::Mute));
+        hits.push((cover.row, Hot::Cover));
+        divider(&mut y, rl, rr, &mut dividers);
+
+        // —— 自动隐藏条件：鼠标移出（及其子项）、屏幕角、离开、接投影、耳机断开 ——
+        let auto_hide = toggle(&mut y, rl, rr, false);
+        let hide_delay = Stepper::new(rsub, rr, y, line_h, s(30), s(70), s(4));
+        y += line_h + gap;
+        let reveal_delay = Stepper::new(rsub, rr, y, line_h, s(30), s(70), s(4));
+        y += line_h + gap;
+        let auto_focus = toggle(&mut y, rsub, rr, false);
+        let corner = Field::new(rl, rr, y, line_h, s(46), s(30));
+        y += line_h + gap;
+        let away = toggle(&mut y, rl, rr, false);
+        let projector = toggle(&mut y, rl, rr, false);
+        let headphones = toggle(&mut y, rl, rr, true);
+        hits.push((auto_hide.row, Hot::AutoHide));
+        if self.cfg.auto_hide {
+            hits.push((hide_delay.minus, Hot::DelayMinus));
+            hits.push((hide_delay.plus, Hot::DelayPlus));
+            hits.push((reveal_delay.minus, Hot::RevealMinus));
+            hits.push((reveal_delay.plus, Hot::RevealPlus));
+            hits.push((auto_focus.row, Hot::AutoFocus));
+        }
+        let c = corner.ctrl;
+        let (mx, my) = ((c.left + c.right) / 2, (c.top + c.bottom) / 2);
+        let corner_cells = [
+            rect(c.left, c.top, mx, my),
+            rect(mx, c.top, c.right, my),
+            rect(c.left, my, mx, c.bottom),
+            rect(mx, my, c.right, c.bottom),
+        ];
+        for (i, cell) in corner_cells.iter().enumerate() {
+            hits.push((*cell, Hot::CornerAt(i as u8 + 1)));
+        }
+        hits.push((corner.row, Hot::Corner));
+        hits.push((away.row, Hot::Away));
+        hits.push((projector.row, Hot::Projector));
+        hits.push((headphones.row, Hot::Headphones));
+        divider(&mut y, rl, rr, &mut dividers);
+
+        // —— 半透明，及其滑块、鼠标穿透、滚轮调节 ——
+        let opacity = toggle(&mut y, rl, rr, false);
+        let slider_track = rect(rsub, y, rr - s(52), y + s(32));
+        y = slider_track.bottom + gap;
+        let click_through = toggle(&mut y, rsub, rr, false);
+        let wheel = toggle(&mut y, rsub, rr, true);
+        hits.push((opacity.row, Hot::Opacity));
+        if self.cfg.transparency_enabled {
+            hits.push((slider_track, Hot::Slider));
+            hits.push((click_through.row, Hot::ClickThrough));
+            hits.push((wheel.row, Hot::Wheel));
+        }
+        divider(&mut y, rl, rr, &mut dividers);
+
+        // —— 隐蔽 ——
+        let disguise = toggle(&mut y, rl, rr, false);
+        let tray = toggle(&mut y, rl, rr, true);
+        hits.push((disguise.row, Hot::Disguise));
+        hits.push((tray.row, Hot::Tray));
+        let bottom = y;
+
+        // ======================= 左栏（自底向上排，与右栏底部对齐） =======================
+        let btn_h = s(42);
+        let btn_top = bottom - btn_h;
+        let wage_top = btn_top - s(12) - line_h;
+        let stats_top = wage_top - gap - line_h;
+        let div_y = stats_top - s(12) - div_h;
+        dividers.push(rect(ll, div_y, lr, div_y + div_h));
+        let peek_top = div_y - s(12) - line_h;
+        let show_top = peek_top - gap - line_h;
+        let hide_top = show_top - gap - line_h;
 
         // —— 窗口列表卡片：可滚动行 + 底部“拾取窗口” ——
         let inner = s(6);
         let row_h = s(LIST_ROW_H);
-        let list_inner_h = row_h * LIST_VISIBLE_ROWS;
-        let list_view = rect(left + inner, y + inner, right - inner, y + inner + list_inner_h);
-        let pick_top = list_view.bottom + inner;
-        let pick_btn = rect(left, pick_top, right, pick_top + s(38));
-        let list_panel = rect(left, y, right, pick_btn.bottom);
-        y = list_panel.bottom + s(16);
+        let pick_h = s(38);
+        let list_inner_h = (hide_top - s(16) - pad - 2 * inner - pick_h).max(row_h * LIST_MIN_ROWS);
+        let list_view = rect(ll + inner, pad + inner, lr - inner, pad + inner + list_inner_h);
+        let pick_btn = rect(ll, list_view.bottom + inner, lr, list_view.bottom + inner + pick_h);
+        let list_panel = rect(ll, pad, lr, pick_btn.bottom);
 
         // 行数据由 App 统一生成：已选中组（含隐藏 / 未运行，始终显示且可取消）在上，
         // 可选组在下。位置稳定，不因窗口隐藏 / 进程退出而消失。
         let base = list_view.top - self.ui.list_scroll;
         let list_rows = self.build_list_rows();
         let mut rows = Vec::with_capacity(list_rows.len());
-        for (i, lr) in list_rows.into_iter().enumerate() {
+        for (i, lr_) in list_rows.into_iter().enumerate() {
             let top = base + i as i32 * row_h;
             let row = rect(list_view.left, top, list_view.right, top + row_h - s(3));
             let cb = s(20);
@@ -317,12 +468,12 @@ impl App {
                 hits.push((visible, Hot::Row(i)));
             }
             rows.push(RowHit {
-                kind: lr.kind,
+                kind: lr_.kind,
                 key: i,
-                title: lr.title,
-                checked: lr.checked,
-                dim: lr.dim,
-                tag: lr.tag,
+                title: lr_.title,
+                checked: lr_.checked,
+                dim: lr_.dim,
+                tag: lr_.tag,
                 row,
                 check,
             });
@@ -330,67 +481,29 @@ impl App {
         let row_full_height = rows.len() as i32 * row_h;
         hits.push((pick_btn, Hot::Pick));
 
-        let mut divider = |y: &mut i32| {
-            *y += s(12);
-            dividers.push(rect(left, *y, right, *y + s(1).max(1)));
-            *y += s(1).max(1) + s(12);
-        };
-
-        // —— 老板键：隐藏键 / 显示键（两者相同即为切换键） ——
-        let hide_key = Field::new(left, right, y, line_h, s(180), s(32));
-        y += line_h + gap;
-        let show_key = Field::new(left, right, y, line_h, s(180), s(32));
-        y += line_h;
+        // —— 老板键：隐藏键 / 显示键（两者相同即为切换键），及按住显示 ——
+        let hide_key = Field::new(ll, lr, hide_top, line_h, s(180), s(32));
+        let show_key = Field::new(ll, lr, show_top, line_h, s(180), s(32));
+        let peek = Field::new(ll + s(INDENT), lr, peek_top, line_h, tgl_w, tgl_h);
         hits.push((hide_key.row, Hot::HideKey));
         hits.push((show_key.row, Hot::ShowKey));
-        divider(&mut y);
+        hits.push((peek.row, Hot::Peek));
 
-        // —— 鼠标移出隐藏，及其子项 ——
-        let auto_hide = Field::new(left, right, y, line_h, tgl_w, tgl_h);
-        y += line_h + gap;
-        let hide_delay = Stepper::new(sub, right, y, line_h, s(30), s(70), s(4));
-        y += line_h + gap;
-        let reveal_delay = Stepper::new(sub, right, y, line_h, s(30), s(70), s(4));
-        y += line_h + gap;
-        let auto_focus = Field::new(sub, right, y, line_h, tgl_w, tgl_h);
-        y += line_h;
-        hits.push((auto_hide.row, Hot::AutoHide));
-        if self.cfg.auto_hide {
-            hits.push((hide_delay.minus, Hot::DelayMinus));
-            hits.push((hide_delay.plus, Hot::DelayPlus));
-            hits.push((reveal_delay.minus, Hot::RevealMinus));
-            hits.push((reveal_delay.plus, Hot::RevealPlus));
-            hits.push((auto_focus.row, Hot::AutoFocus));
+        // —— 摸鱼统计（及其时薪）、底部按钮 ——
+        let stats = Field::new(ll, lr, stats_top, line_h, tgl_w, tgl_h);
+        let wage = Field::new(ll + s(INDENT), lr, wage_top, line_h, s(120), s(32));
+        let mid = (ll + lr) / 2;
+        let hide_btn = rect(ll, btn_top, mid - s(6), bottom);
+        let show_btn = rect(mid + s(6), btn_top, lr, bottom);
+        hits.push((stats.row, Hot::Stats));
+        if self.cfg.stats {
+            hits.push((wage.row, Hot::Wage));
         }
-        divider(&mut y);
-
-        // —— 半透明，及其滑块 ——
-        let opacity = Field::new(left, right, y, line_h, tgl_w, tgl_h);
-        y += line_h + gap;
-        let slider_track = rect(sub, y, right - s(52), y + s(32));
-        y = slider_track.bottom + s(20);
-        hits.push((opacity.row, Hot::Opacity));
-        if self.cfg.transparency_enabled {
-            hits.push((slider_track, Hot::Slider));
-        }
-        divider(&mut y);
-
-        // —— 进程伪装 ——
-        let disguise = Field::new(left, right, y, line_h, tgl_w, tgl_h);
-        y += line_h;
-        hits.push((disguise.row, Hot::Disguise));
-
-        // —— 底部按钮 ——
-        let btn_h = s(42);
-        let mid = width / 2;
-        let hide_btn = rect(left, y, mid - s(6), y + btn_h);
-        let show_btn = rect(mid + s(6), y, right, y + btn_h);
-        y += btn_h + pad;
         hits.push((hide_btn, Hot::HideAll));
         hits.push((show_btn, Hot::ShowAll));
 
         Layout {
-            height_needed: y,
+            height_needed: list_panel.bottom.max(bottom) + pad,
             list_panel,
             list_view,
             pick_btn,
@@ -399,16 +512,29 @@ impl App {
             list_inner_h,
             hide_key,
             show_key,
+            peek,
+            stats,
+            wage,
+            hide_btn,
+            show_btn,
+            mute,
+            cover,
             auto_hide,
             hide_delay,
             reveal_delay,
             auto_focus,
+            corner,
+            corner_cells,
+            away,
+            projector,
+            headphones,
             opacity,
             slider_track,
+            click_through,
+            wheel,
             disguise,
+            tray,
             dividers,
-            hide_btn,
-            show_btn,
             hits,
         }
     }
@@ -456,10 +582,21 @@ impl App {
         }
 
         w::fill_rect(c, &client, theme::BG);
-        self.draw_window_list(c, &layout);
 
+        // —— 左栏 ——
+        self.draw_window_list(c, &layout);
         self.draw_hotkey(c, &layout.hide_key, "隐藏键", HkSlot::Hide, Hot::HideKey);
         self.draw_hotkey(c, &layout.show_key, "显示键", HkSlot::Show, Hot::ShowKey);
+        self.draw_toggle_field(c, &layout.peek, "按住显示", self.cfg.peek, true, Hot::Peek);
+        self.draw_toggle_field(c, &layout.stats, "摸鱼统计", self.cfg.stats, true, Hot::Stats);
+        self.draw_status(c, &layout.stats, &self.stats_text(), theme::TEXT_DIM);
+        self.draw_wage_field(c, &layout.wage, self.cfg.stats);
+        self.draw_button(c, &layout.hide_btn, "全部隐藏", true, Hot::HideAll, true);
+        self.draw_button(c, &layout.show_btn, "全部恢复", false, Hot::ShowAll, true);
+
+        // —— 右栏 ——
+        self.draw_toggle_field(c, &layout.mute, "隐藏时静音", self.cfg.mute_on_hide, true, Hot::Mute);
+        self.draw_toggle_field(c, &layout.cover, "切回工作窗口", self.cfg.cover, true, Hot::Cover);
 
         let auto = self.cfg.auto_hide;
         self.draw_toggle_field(c, &layout.auto_hide, "鼠标移出隐藏", self.cfg.auto_hide, true, Hot::AutoHide);
@@ -480,19 +617,23 @@ impl App {
             (Hot::RevealMinus, Hot::RevealPlus),
         );
         self.draw_toggle_field(c, &layout.auto_focus, "显示时聚焦", self.cfg.auto_focus, auto, Hot::AutoFocus);
+        self.draw_corner_field(c, &layout.corner, &layout.corner_cells);
+        self.draw_toggle_field(c, &layout.away, "离开时隐藏", self.cfg.hide_on_away, true, Hot::Away);
+        self.draw_toggle_field(c, &layout.projector, "接投影时隐藏", self.cfg.hide_on_projector, true, Hot::Projector);
+        self.draw_toggle_field(c, &layout.headphones, "耳机断开时隐藏", self.cfg.hide_on_headphones, true, Hot::Headphones);
 
         let trans = self.cfg.transparency_enabled;
         self.draw_toggle_field(c, &layout.opacity, "半透明", trans, true, Hot::Opacity);
         self.draw_slider(c, &layout.slider_track, trans);
+        self.draw_toggle_field(c, &layout.click_through, "鼠标穿透", self.cfg.click_through, trans, Hot::ClickThrough);
+        self.draw_toggle_field(c, &layout.wheel, "Alt + 滚轮调节", self.cfg.wheel_opacity, trans, Hot::Wheel);
 
         self.draw_toggle_field(c, &layout.disguise, "进程伪装", self.cfg.disguise, true, Hot::Disguise);
+        self.draw_toggle_field(c, &layout.tray, "托盘图标", self.cfg.tray_icon, true, Hot::Tray);
 
         for d in &layout.dividers {
             w::fill_rect(c, d, theme::DIVIDER);
         }
-
-        self.draw_button(c, &layout.hide_btn, "全部隐藏", true, Hot::HideAll, true);
-        self.draw_button(c, &layout.show_btn, "全部恢复", false, Hot::ShowAll, true);
 
         self.ui.layout = layout;
     }
@@ -500,6 +641,88 @@ impl App {
     /// 某元素此刻是否处于悬停态。
     fn hovered(&self, which: Hot) -> bool {
         self.ui.hover == which
+    }
+
+    /// 设置行的状态文字（如“被占用”“今日 1h05m”）：右对齐，紧贴控件左侧。
+    fn draw_status(&self, c: &Canvas, f: &Field, txt: &str, color: u32) {
+        if txt.is_empty() {
+            return;
+        }
+        let r = rect(f.row.left, f.row.top, f.ctrl.left - scale(10, self.ui.dpi), f.row.bottom);
+        w::text(c, txt, &r, self.ui.fonts.small, color, w::DT_RIGHT | TEXT_FLAGS);
+    }
+
+    /// 时薪行：标签 + 右侧可点击编辑的输入框（交互同热键框：点击进入编辑，
+    /// Enter / 点别处确认，Esc 取消）。编辑时原文先全选，输入即替换。
+    fn draw_wage_field(&self, c: &Canvas, f: &Field, enabled: bool) {
+        let s = |v: i32| scale(v, self.ui.dpi);
+        self.draw_label(c, &f.row, f.ctrl.left, "时薪", enabled);
+        let editing = self.ui.editing_wage.as_deref();
+        let border = if editing.is_some() {
+            theme::ACCENT
+        } else if enabled && self.hovered(Hot::Wage) {
+            theme::ACCENT_HOVER
+        } else {
+            theme::BORDER
+        };
+        w::round_outline(c, &f.ctrl, s(8), border, 1, Some(theme::SURFACE));
+        let font = self.ui.fonts.body_strong;
+        let inner = rect(f.ctrl.left + s(8), f.ctrl.top, f.ctrl.right - s(8), f.ctrl.bottom);
+        match editing {
+            Some(buf) => c.clipped(&inner, || {
+                let tw = w::text_width(c, buf, font);
+                let x0 = (f.ctrl.left + f.ctrl.right - tw) / 2;
+                let (top, bottom) = (f.ctrl.top + s(7), f.ctrl.bottom - s(7));
+                let r = rect(x0, f.ctrl.top, x0 + tw + s(2), f.ctrl.bottom);
+                if self.ui.wage_selected && !buf.is_empty() {
+                    w::round_fill(c, &rect(x0 - s(3), top, x0 + tw + s(3), bottom), s(3), theme::ACCENT);
+                    w::text(c, buf, &r, font, theme::ON_ACCENT, w::DT_LEFT | TEXT_FLAGS);
+                } else {
+                    w::text(c, buf, &r, font, theme::TEXT, w::DT_LEFT | TEXT_FLAGS);
+                    let x = x0 + tw + s(1);
+                    w::fill_rect(c, &rect(x, top, x + s(1).max(1), bottom), theme::TEXT);
+                }
+            }),
+            None => {
+                let txt = if self.cfg.wage.is_empty() { "—" } else { self.cfg.wage.as_str() };
+                let color = match (self.cfg.wage.is_empty(), enabled) {
+                    (_, false) => theme::TEXT_OFF,
+                    (true, true) => theme::TEXT_DIM,
+                    (false, true) => theme::TEXT,
+                };
+                w::text(c, txt, &inner, font, color, w::DT_CENTER | TEXT_FLAGS | w::DT_END_ELLIPSIS);
+            }
+        }
+    }
+
+    /// 屏幕角行：标签 + 右侧的屏幕缩略框，点框里的某个角选中它，再点一次关闭。
+    fn draw_corner_field(&self, c: &Canvas, f: &Field, cells: &[RECT; 4]) {
+        let s = |v: i32| scale(v, self.ui.dpi);
+        self.draw_label(c, &f.row, f.ctrl.left, "屏幕角隐藏", true);
+        let selected = self.cfg.corner;
+        let row_hovered = self.hovered(Hot::Corner) || matches!(self.ui.hover, Hot::CornerAt(_));
+        let border = if selected != 0 {
+            theme::ACCENT
+        } else if row_hovered {
+            theme::ACCENT_HOVER
+        } else {
+            theme::BORDER
+        };
+        w::round_outline(c, &f.ctrl, s(6), border, 1, Some(theme::SURFACE));
+        let (mw, mh, inset) = (s(12), s(8), s(4));
+        for (i, cell) in cells.iter().enumerate() {
+            let which = i as u8 + 1;
+            let x = if i % 2 == 0 { cell.left + inset } else { cell.right - inset - mw };
+            let y = if i < 2 { cell.top + inset } else { cell.bottom - inset - mh };
+            let color = if selected == which {
+                theme::ACCENT
+            } else if self.hovered(Hot::CornerAt(which)) {
+                theme::TEXT_DIM
+            } else {
+                theme::BORDER
+            };
+            w::round_fill(c, &rect(x, y, x + mw, y + mh), s(2), color);
+        }
     }
 
     /// 设置行左侧的标签，右边界止于控件左侧。
@@ -598,8 +821,7 @@ impl App {
 
         self.draw_label(c, &f.row, f.ctrl.left, label, true);
         if conflict {
-            let r = rect(f.row.left, f.row.top, f.ctrl.left - s(10), f.row.bottom);
-            w::text(c, "被占用", &r, self.ui.fonts.small, theme::DANGER, w::DT_RIGHT | TEXT_FLAGS);
+            self.draw_status(c, f, "被占用", theme::DANGER);
         }
 
         let border = if capturing {
@@ -710,16 +932,37 @@ impl App {
     /// 处理左键按下。返回是否需要重绘。
     pub fn on_lbutton_down(&mut self, x: i32, y: i32) -> bool {
         let hot = self.hit_test(x, y);
-        // 点击热键行以外的地方时取消录制。
+        // 点击热键行以外的地方时取消录制；点击时薪框以外的地方时确认编辑。
         if !matches!(hot, Hot::HideKey | Hot::ShowKey) {
             self.end_hotkey_capture(None);
+        }
+        if hot != Hot::Wage {
+            self.end_wage_edit(true);
         }
         match hot {
             Hot::Pick => self.enter_pick_mode(),
             Hot::HideKey => self.begin_hotkey_capture(HkSlot::Hide),
             Hot::ShowKey => self.begin_hotkey_capture(HkSlot::Show),
+            Hot::Wage => {
+                if self.ui.editing_wage.is_none() {
+                    self.ui.editing_wage = Some(self.cfg.wage.clone());
+                    self.ui.wage_selected = true;
+                }
+            }
             Hot::AutoHide => self.set_auto_hide(!self.cfg.auto_hide),
             Hot::AutoFocus => self.set_auto_focus(!self.cfg.auto_focus),
+            Hot::Peek => self.set_peek(!self.cfg.peek),
+            Hot::Stats => self.set_stats(!self.cfg.stats),
+            Hot::Mute => self.set_mute_on_hide(!self.cfg.mute_on_hide),
+            Hot::Cover => self.set_cover(!self.cfg.cover),
+            Hot::Corner => self.set_corner(if self.cfg.corner == 0 { DEFAULT_CORNER } else { 0 }),
+            Hot::CornerAt(k) => self.set_corner(if self.cfg.corner == k { 0 } else { k }),
+            Hot::Away => self.set_hide_on_away(!self.cfg.hide_on_away),
+            Hot::Projector => self.set_hide_on_projector(!self.cfg.hide_on_projector),
+            Hot::Headphones => self.set_hide_on_headphones(!self.cfg.hide_on_headphones),
+            Hot::ClickThrough => self.set_click_through(!self.cfg.click_through),
+            Hot::Wheel => self.set_wheel_opacity(!self.cfg.wheel_opacity),
+            Hot::Tray => self.set_tray_icon(!self.cfg.tray_icon),
             // set_delay / set_reveal_delay 内部已 clamp 到 [MIN_DELAY_MS, MAX_DELAY_MS]。
             Hot::DelayMinus => self.set_delay(self.cfg.auto_hide_delay_ms.saturating_sub(DELAY_STEP_MS)),
             Hot::DelayPlus => self.set_delay((self.cfg.auto_hide_delay_ms + DELAY_STEP_MS).min(MAX_DELAY_MS)),
@@ -733,10 +976,7 @@ impl App {
                 let p = self.opacity_from_x(x, &track);
                 self.set_opacity_percent(p);
             }
-            Hot::HideAll => {
-                self.hide_all();
-                self.update_tray_tip();
-            }
+            Hot::HideAll => self.on_hide_key(),
             Hot::ShowAll => {
                 self.show_all();
                 self.update_tray_tip();
@@ -809,8 +1049,25 @@ impl App {
         self.ui.list_scroll = self.ui.list_scroll.clamp(0, max_scroll);
     }
 
-    /// 键盘按下（用于热键录制）。返回是否需要重绘。
+    /// 键盘按下（用于热键录制与时薪编辑）。返回是否需要重绘。
     pub fn on_key_down(&mut self, vk: u32) -> bool {
+        if let Some(buf) = self.ui.editing_wage.as_mut() {
+            match vk {
+                0x0D => self.end_wage_edit(true),  // Enter
+                0x1B => self.end_wage_edit(false), // Esc
+                0x08 => {
+                    // Backspace：全选时清空，否则删去最后一个字符。
+                    if self.ui.wage_selected {
+                        buf.clear();
+                    } else {
+                        buf.pop();
+                    }
+                    self.ui.wage_selected = false;
+                }
+                _ => return false, // 字符由 WM_CHAR 送达
+            }
+            return true;
+        }
         if self.ui.capturing_hotkey.is_none() {
             return false;
         }
@@ -829,6 +1086,34 @@ impl App {
     /// 热键录制中按下鼠标中键 / 侧键时调用：连同当前修饰键设为该槽位的老板键。
     pub fn capture_mouse(&mut self, button: MouseButton) {
         self.end_hotkey_capture(Some(Hotkey::Mouse { mods: held_mods(), button }));
+    }
+
+    /// 输入字符（WM_CHAR，含输入法上屏的文字）。返回是否需要重绘。
+    pub fn on_char(&mut self, code: u32) -> bool {
+        let Some(buf) = self.ui.editing_wage.as_mut() else {
+            return false;
+        };
+        // 控制字符（Enter / Esc / Backspace 等）已在 on_key_down 处理；代理对（emoji）不接受。
+        let Some(ch) = char::from_u32(code).filter(|c| !c.is_control()) else {
+            return false;
+        };
+        if self.ui.wage_selected {
+            buf.clear();
+            self.ui.wage_selected = false;
+        }
+        if buf.chars().count() < WAGE_MAX_CHARS {
+            buf.push(ch);
+        }
+        true
+    }
+
+    /// 结束时薪编辑：`commit` 为 true 时保存（无法解析的输入保持原值）。
+    pub fn end_wage_edit(&mut self, commit: bool) {
+        if let Some(buf) = self.ui.editing_wage.take() {
+            if commit {
+                self.set_wage(&buf);
+            }
+        }
     }
 }
 

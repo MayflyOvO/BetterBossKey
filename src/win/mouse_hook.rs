@@ -1,21 +1,25 @@
-//! 全局低级鼠标钩子（WH_MOUSE_LL），让老板键支持鼠标中键 / 侧键。
+//! 全局低级鼠标钩子（WH_MOUSE_LL）：鼠标中键 / 侧键老板键、拾取模式、Alt+滚轮调节不透明度。
 //!
 //! 钩子在安装它的线程（我们的主线程，有消息循环）上回调。匹配到配置的鼠标按键
-//! （并满足修饰键）时，向主窗口投递回调消息并“吞掉”该事件，使该按键成为专用老板键。
+//! （并满足修饰键）时，向主窗口投递回调消息并“吞掉”该事件，使该按键成为专用老板键；
+//! 抬起时另行通知，供“按住显示”在松开时隐藏。三类钩子相互独立，按需安装。
 //! 状态用原子量保存，供静态回调函数读取（单线程，无并发问题）。
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSLLHOOKSTRUCT,
-    WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, GetWindowRect, IsWindowVisible, PostMessageW, SetWindowsHookExW,
+    UnhookWindowsHookEx, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::win::hotkey::MouseButton;
@@ -40,6 +44,8 @@ static B_MSG: [AtomicU32; MAX_BINDINGS] = [AtomicU32::new(0), AtomicU32::new(0)]
 static NBIND: AtomicU32 = AtomicU32::new(0);
 // 已吞掉按下的按键位掩码（按 button_code 置位），用于吞掉配对的抬起。
 static CONSUMED_MASK: AtomicU32 = AtomicU32::new(0);
+/// 被吞掉的按键抬起时投递给主窗口的消息（“按住显示”据此在松开时隐藏）。
+static RELEASE_MSG: AtomicU32 = AtomicU32::new(0);
 
 fn button_code(b: MouseButton) -> u32 {
     match b {
@@ -50,13 +56,14 @@ fn button_code(b: MouseButton) -> u32 {
 }
 
 /// 安装鼠标钩子并设定要监听的若干绑定。重复调用会先卸载旧钩子。返回是否安装成功。
-/// 传入空切片等价于卸载（不安装钩子）。
-pub fn install(hwnd: HWND, bindings: &[Binding]) -> bool {
+/// 传入空切片等价于卸载（不安装钩子）。`release_msg` 在绑定的按键抬起时投递。
+pub fn install(hwnd: HWND, bindings: &[Binding], release_msg: u32) -> bool {
     uninstall();
     if bindings.is_empty() {
         return false;
     }
     TARGET_HWND.store(hwnd as isize, Ordering::SeqCst);
+    RELEASE_MSG.store(release_msg, Ordering::SeqCst);
     let n = bindings.len().min(MAX_BINDINGS);
     for i in 0..n {
         B_BTN[i].store(button_code(bindings[i].button), Ordering::SeqCst);
@@ -129,6 +136,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                     let bit = 1u32 << this;
                     if CONSUMED_MASK.load(Ordering::SeqCst) & bit != 0 {
                         CONSUMED_MASK.fetch_and(!bit, Ordering::SeqCst);
+                        let hwnd = TARGET_HWND.load(Ordering::SeqCst) as HWND;
+                        PostMessageW(hwnd, RELEASE_MSG.load(Ordering::SeqCst), 0, 0);
                         return 1; // 吞掉配对的抬起，避免下游收到半个事件
                     }
                 }
@@ -207,6 +216,97 @@ unsafe extern "system" fn pick_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 }
                 _ => {}
             }
+        }
+    }
+    CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+}
+
+// ——————————————————————— Alt+滚轮调节不透明度 ———————————————————————
+//
+// 光标位于某个受管窗口上且按住 Alt 时，吞掉滚轮并把滚动量投递给主窗口。
+// 按窗口矩形判断而不是 WindowFromPoint：后者会跳过鼠标穿透的窗口。
+
+static WHEEL_HOOK: AtomicIsize = AtomicIsize::new(0);
+static WHEEL_HWND: AtomicIsize = AtomicIsize::new(0);
+static WHEEL_MSG: AtomicU32 = AtomicU32::new(0);
+static WHEEL_TARGETS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// 安装滚轮钩子（已安装则保持）。滚动量（120 的倍数）作为 wParam 投递。
+pub fn install_wheel(hwnd: HWND, msg: u32) -> bool {
+    if WHEEL_HOOK.load(Ordering::SeqCst) != 0 {
+        return true;
+    }
+    WHEEL_HWND.store(hwnd as isize, Ordering::SeqCst);
+    WHEEL_MSG.store(msg, Ordering::SeqCst);
+    unsafe {
+        let h = SetWindowsHookExW(
+            WH_MOUSE_LL,
+            Some(wheel_proc),
+            GetModuleHandleW(std::ptr::null()),
+            0,
+        );
+        WHEEL_HOOK.store(h as isize, Ordering::SeqCst);
+        !h.is_null()
+    }
+}
+
+pub fn uninstall_wheel() {
+    let h = WHEEL_HOOK.swap(0, Ordering::SeqCst);
+    if h != 0 {
+        unsafe {
+            UnhookWindowsHookEx(h as *mut c_void);
+        }
+    }
+}
+
+/// 更新可响应 Alt+滚轮 的窗口集合。
+pub fn set_wheel_targets(hwnds: Vec<isize>) {
+    if let Ok(mut v) = WHEEL_TARGETS.lock() {
+        *v = hwnds;
+    }
+}
+
+/// 发送一个无含义的按键，避免单独按下又松开的 Alt 激活目标程序的菜单栏。
+pub fn suppress_alt_menu() {
+    const VK_NONE: u16 = 0xE8; // 未分配的虚拟键
+    let key = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VK_NONE,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [key(0), key(KEYEVENTF_KEYUP)];
+    unsafe {
+        SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+unsafe extern "system" fn wheel_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && wparam as u32 == WM_MOUSEWHEEL && (GetAsyncKeyState(0x12) as u16 & 0x8000) != 0 {
+        let info = &*(lparam as *const MSLLHOOKSTRUCT);
+        let over_target = WHEEL_TARGETS.try_lock().is_ok_and(|v| {
+            v.iter().any(|&h| {
+                let hwnd = h as HWND;
+                let mut r: RECT = std::mem::zeroed();
+                IsWindowVisible(hwnd) != 0
+                    && GetWindowRect(hwnd, &mut r) != 0
+                    && info.pt.x >= r.left
+                    && info.pt.x < r.right
+                    && info.pt.y >= r.top
+                    && info.pt.y < r.bottom
+            })
+        });
+        if over_target {
+            let delta = (info.mouseData >> 16) as u16 as i16 as isize;
+            let hwnd = WHEEL_HWND.load(Ordering::SeqCst) as HWND;
+            PostMessageW(hwnd, WHEEL_MSG.load(Ordering::SeqCst), delta as usize, 0);
+            return 1;
         }
     }
     CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)

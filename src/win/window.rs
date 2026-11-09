@@ -15,11 +15,11 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, GWL_EXSTYLE, GW_OWNER, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNA, WS_EX_APPWINDOW, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNA, WS_EX_APPWINDOW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 use crate::util::from_wide;
@@ -31,8 +31,12 @@ pub const APP_WINDOW_CLASS: &str = "BetterBossKeyMainWindow";
 ///
 /// 即使程序异常退出 / 崩溃，也能据此把窗口恢复出来，避免用户的窗口永久隐藏
 /// （隐藏的窗口不在任务栏 / Alt-Tab 中，很难手动找回）。`hide` / `show` 会维护它，
-/// [`restore_all_hidden`] 在退出 / 会话结束 / panic 时兜底恢复。
+/// [`restore_all_hidden`] 在退出 / 会话结束 / panic 时兜底恢复。登记表的每次变化
+/// 还会写入崩溃恢复文件（见 [`crate::recovery`]），连强制结束进程也能在下次启动时找回。
 static HIDDEN_WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// 被本程序设置了半透明 / 鼠标穿透的窗口登记表，兜底方式同上。
+static STYLED_WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 
 /// 一个可被管理的顶层窗口的快照信息。
 #[derive(Clone)]
@@ -63,50 +67,85 @@ pub fn enumerate() -> Vec<WindowInfo> {
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
     let out = &mut *(lparam as *mut Vec<WindowInfo>);
-
-    // 必须可见。
-    if IsWindowVisible(hwnd) == 0 {
-        return 1;
+    if let Some(title) = candidate_title(hwnd) {
+        out.push(WindowInfo {
+            hwnd: hwnd as isize,
+            title,
+        });
     }
+    1 // 继续枚举
+}
 
-    let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-    let is_tool = ex_style & WS_EX_TOOLWINDOW != 0;
-    let is_app = ex_style & WS_EX_APPWINDOW != 0;
-    let has_owner = !GetWindow(hwnd, GW_OWNER).is_null();
+/// 窗口是否“适合作为目标”（类似 Alt-Tab 列表），是则返回其标题。
+fn candidate_title(hwnd: HWND) -> Option<String> {
+    unsafe {
+        // 必须可见。
+        if IsWindowVisible(hwnd) == 0 {
+            return None;
+        }
 
-    // Alt-Tab 可见性规则：要么显式声明为 AppWindow，要么是“无属主、非工具窗口”。
-    if !is_app && (is_tool || has_owner) {
-        return 1;
-    }
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let is_tool = ex_style & WS_EX_TOOLWINDOW != 0;
+        let is_app = ex_style & WS_EX_APPWINDOW != 0;
+        let has_owner = !GetWindow(hwnd, GW_OWNER).is_null();
 
-    // 排除被 DWM 隐藏（cloaked）的窗口，例如未激活的 UWP 应用残留句柄。
-    let mut cloaked: i32 = 0;
-    let hr = DwmGetWindowAttribute(
-        hwnd,
-        DWMWA_CLOAKED as u32,
-        &mut cloaked as *mut i32 as *mut c_void,
-        std::mem::size_of::<i32>() as u32,
-    );
-    if hr == 0 && cloaked != 0 {
-        return 1;
+        // Alt-Tab 可见性规则：要么显式声明为 AppWindow，要么是“无属主、非工具窗口”。
+        if !is_app && (is_tool || has_owner) {
+            return None;
+        }
+
+        // 排除被 DWM 隐藏（cloaked）的窗口，例如未激活的 UWP 应用残留句柄。
+        let mut cloaked: i32 = 0;
+        let hr = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED as u32,
+            &mut cloaked as *mut i32 as *mut c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        if hr == 0 && cloaked != 0 {
+            return None;
+        }
     }
 
     // 必须有非空标题。
     let title = window_text(hwnd);
     if title.trim().is_empty() {
-        return 1;
+        return None;
     }
 
     // 排除本程序自身的窗口。
     if class_name(hwnd) == APP_WINDOW_CLASS {
-        return 1;
+        return None;
     }
+    Some(title)
+}
 
-    out.push(WindowInfo {
-        hwnd: hwnd as isize,
-        title,
-    });
-    1 // 继续枚举
+/// 当前前台窗口（无则为 0）。
+pub fn foreground() -> isize {
+    unsafe { GetForegroundWindow() as isize }
+}
+
+/// 窗口是否是一个可切换到的普通应用窗口（与窗口列表的筛选规则一致）。
+pub fn is_switchable(hwnd: isize) -> bool {
+    hwnd != 0 && is_alive(hwnd) && candidate_title(as_hwnd(hwnd)).is_some()
+}
+
+/// 窗口是否最小化。
+pub fn is_minimized(hwnd: isize) -> bool {
+    unsafe { IsIconic(as_hwnd(hwnd)) != 0 }
+}
+
+/// 把窗口切到前台；最小化的先还原。
+pub fn activate(hwnd: isize) {
+    if !is_alive(hwnd) {
+        return;
+    }
+    unsafe {
+        if IsIconic(as_hwnd(hwnd)) != 0 {
+            ShowWindow(as_hwnd(hwnd), SW_RESTORE);
+        }
+    }
+    force_foreground(as_hwnd(hwnd));
 }
 
 /// 读取窗口标题。
@@ -186,14 +225,39 @@ pub fn hide(hwnd: isize) {
     }
 }
 
+/// 往登记表加入一项；有变化时同步到崩溃恢复文件。
+fn registry_add(reg: &Mutex<Vec<isize>>, hwnd: isize) {
+    let added = match reg.lock() {
+        Ok(mut v) if !v.contains(&hwnd) => {
+            v.push(hwnd);
+            true
+        }
+        _ => false,
+    };
+    if added {
+        crate::recovery::persist();
+    }
+}
+
+/// 从登记表移除一项；有变化时同步到崩溃恢复文件。
+fn registry_remove(reg: &Mutex<Vec<isize>>, hwnd: isize) {
+    let removed = match reg.lock() {
+        Ok(mut v) => {
+            let n = v.len();
+            v.retain(|&h| h != hwnd);
+            v.len() != n
+        }
+        Err(_) => false,
+    };
+    if removed {
+        crate::recovery::persist();
+    }
+}
+
 /// 仅登记到隐藏兜底表（不改变窗口可见性）。用于重启后重新接管“此前被我们
 /// 隐藏、仍处于隐藏状态”的窗口，使其重新获得老板键恢复与退出兜底。
 pub fn register_hidden(hwnd: isize) {
-    if let Ok(mut v) = HIDDEN_WINDOWS.lock() {
-        if !v.contains(&hwnd) {
-            v.push(hwnd);
-        }
-    }
+    registry_add(&HIDDEN_WINDOWS, hwnd);
 }
 
 /// 显示窗口并强制置于前台，并从隐藏登记表移除。
@@ -204,9 +268,7 @@ pub fn show(hwnd: isize) {
         }
         force_foreground(as_hwnd(hwnd));
     }
-    if let Ok(mut v) = HIDDEN_WINDOWS.lock() {
-        v.retain(|&h| h != hwnd);
-    }
+    registry_remove(&HIDDEN_WINDOWS, hwnd);
 }
 
 /// 把窗口强制切到前台。
@@ -241,9 +303,7 @@ pub fn show_no_activate(hwnd: isize) {
             ShowWindow(as_hwnd(hwnd), SW_SHOWNA);
         }
     }
-    if let Ok(mut v) = HIDDEN_WINDOWS.lock() {
-        v.retain(|&h| h != hwnd);
-    }
+    registry_remove(&HIDDEN_WINDOWS, hwnd);
 }
 
 /// 恢复所有登记在册（被本程序隐藏）的窗口并清空登记表。
@@ -251,20 +311,37 @@ pub fn show_no_activate(hwnd: isize) {
 /// 供正常退出 / 会话结束 / panic 兜底调用。用 try_lock 避免在 panic 时（若锁正被
 /// 同一线程持有）死锁；锁中毒时仍取回数据继续恢复。
 pub fn restore_all_hidden() {
-    use std::sync::TryLockError;
-    let mut guard = match HIDDEN_WINDOWS.try_lock() {
-        Ok(g) => g,
-        Err(TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(TryLockError::WouldBlock) => return,
-    };
-    for &h in guard.iter() {
+    for h in drain(&HIDDEN_WINDOWS) {
         if is_alive(h) {
             unsafe {
                 ShowWindow(as_hwnd(h), SW_SHOW);
             }
         }
     }
-    guard.clear();
+}
+
+/// 撤销所有登记在册的半透明 / 穿透样式并清空登记表。用途同 [`restore_all_hidden`]。
+pub fn restore_all_styled() {
+    for h in drain(&STYLED_WINDOWS) {
+        reset_style(h);
+    }
+}
+
+/// 取出并清空登记表（try_lock，理由见 [`restore_all_hidden`]）。
+fn drain(reg: &Mutex<Vec<isize>>) -> Vec<isize> {
+    use std::sync::TryLockError;
+    let mut guard = match reg.try_lock() {
+        Ok(g) => g,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => return Vec::new(),
+    };
+    std::mem::take(&mut *guard)
+}
+
+/// 两张登记表的快照（隐藏的、被改了样式的），供崩溃恢复文件持久化。
+pub fn registry_snapshot() -> (Vec<isize>, Vec<isize>) {
+    let get = |reg: &Mutex<Vec<isize>>| reg.try_lock().map(|v| v.clone()).unwrap_or_default();
+    (get(&HIDDEN_WINDOWS), get(&STYLED_WINDOWS))
 }
 
 /// 给窗口设置半透明度（alpha：0=全透明，255=不透明）。
@@ -280,10 +357,31 @@ pub fn set_opacity(hwnd: isize, alpha: u8) {
         }
         SetLayeredWindowAttributes(h, 0, alpha, LWA_ALPHA);
     }
+    registry_add(&STYLED_WINDOWS, hwnd);
 }
 
-/// 取消半透明，恢复为完全不透明，并移除 layered 扩展样式。
+/// 设置 / 取消鼠标穿透（点击落到下方窗口）。需配合半透明的 layered 样式使用。
+pub fn set_click_through(hwnd: isize, on: bool) {
+    if !is_alive(hwnd) {
+        return;
+    }
+    unsafe {
+        let h = as_hwnd(hwnd);
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
+        let want = if on { ex | WS_EX_TRANSPARENT } else { ex & !WS_EX_TRANSPARENT };
+        if want != ex {
+            SetWindowLongPtrW(h, GWL_EXSTYLE, want as isize);
+        }
+    }
+}
+
+/// 取消半透明与鼠标穿透，恢复为完全不透明，并移除 layered 扩展样式。
 pub fn clear_opacity(hwnd: isize) {
+    reset_style(hwnd);
+    registry_remove(&STYLED_WINDOWS, hwnd);
+}
+
+fn reset_style(hwnd: isize) {
     if !is_alive(hwnd) {
         return;
     }
@@ -292,8 +390,8 @@ pub fn clear_opacity(hwnd: isize) {
         // 先把 alpha 拉满，确保即便移除样式失败窗口也是可见的。
         SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
         let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
-        if ex & WS_EX_LAYERED != 0 {
-            SetWindowLongPtrW(h, GWL_EXSTYLE, (ex & !WS_EX_LAYERED) as isize);
+        if ex & (WS_EX_LAYERED | WS_EX_TRANSPARENT) != 0 {
+            SetWindowLongPtrW(h, GWL_EXSTYLE, (ex & !(WS_EX_LAYERED | WS_EX_TRANSPARENT)) as isize);
             // 触发重绘，让窗口以不透明方式重新呈现。
             SetWindowPos(
                 h,
@@ -335,7 +433,11 @@ pub fn window_at(pt: POINT) -> Option<WindowInfo> {
 
 /// 读取窗口所属进程的可执行文件名（如 `phoneCast.exe`）。失败返回空串。
 pub fn process_name(hwnd: isize) -> String {
-    let pid = window_pid(hwnd);
+    process_name_of(window_pid(hwnd))
+}
+
+/// 读取某进程的可执行文件名。失败返回空串。
+pub fn process_name_of(pid: u32) -> String {
     if pid == 0 {
         return String::new();
     }
