@@ -1,6 +1,7 @@
 //! 崩溃恢复文件：`%APPDATA%\BetterBossKey\recovery.txt`（内部文件，无需手动编辑）。
 //!
-//! 记录此刻被本程序隐藏的窗口、被改了半透明 / 穿透样式的窗口、被置顶的窗口，以及被静音的程序。
+//! 记录此刻被本程序隐藏的窗口、被改了半透明 / 穿透样式的窗口、被置顶的窗口、被去掉标题栏的窗口，
+//! 以及被静音的程序。
 //! 正常退出时它们都已复原，文件随之清空；若进程被强制结束（无法执行任何收尾代码），
 //! 下次启动时据此把窗口与声音找回来（见 `App::recover`）。
 
@@ -32,6 +33,8 @@ pub struct Recovery {
     pub hidden: Vec<Entry>,
     pub styled: Vec<Entry>,
     pub topmost: Vec<Entry>,
+    /// 被去掉标题栏的窗口及去掉的样式位。
+    pub captionless: Vec<(Entry, u32)>,
     pub muted: Vec<String>,
 }
 
@@ -42,19 +45,35 @@ fn path() -> Option<PathBuf> {
     Some(Config::dir()?.join("recovery.txt"))
 }
 
+/// 一个窗口的记录字段：`hwnd<TAB>pid<TAB>class`。
+fn entry_fields(h: isize) -> String {
+    format!("{h}\t{}\t{}", window::window_pid(h), window::class_of(h))
+}
+
+fn parse_entry(fields: &str) -> Option<Entry> {
+    let mut parts = fields.splitn(3, '\t');
+    let (h, pid, class) = (parts.next()?, parts.next()?, parts.next()?);
+    Some(Entry {
+        hwnd: h.parse().ok()?,
+        pid: pid.parse().ok()?,
+        class: class.to_string(),
+    })
+}
+
 /// 把当前登记表写入恢复文件（内容不变则跳过）。
 pub fn persist() {
-    let (hidden, styled, topmost) = window::registry_snapshot();
     let mut out = String::new();
-    for (key, list) in [("hidden", &hidden), ("styled", &styled), ("topmost", &topmost)] {
-        for &h in list.iter() {
+    for (key, list) in window::registry_snapshot() {
+        for h in list {
             if window::is_alive(h) {
-                out.push_str(&format!(
-                    "{key}={h}\t{}\t{}\n",
-                    window::window_pid(h),
-                    window::class_of(h)
-                ));
+                out.push_str(&format!("{key}={}\n", entry_fields(h)));
             }
+        }
+    }
+    // 去掉标题栏的窗口额外记下去掉的样式位，放在最前：`captionless=bits<TAB>hwnd<TAB>pid<TAB>class`。
+    for (h, bits) in window::captionless_snapshot() {
+        if window::is_alive(h) {
+            out.push_str(&format!("captionless={bits}\t{}\n", entry_fields(h)));
         }
     }
     for exe in audio::muted_exes() {
@@ -93,23 +112,21 @@ pub fn load() -> Recovery {
         };
         match key {
             "hidden" | "styled" | "topmost" => {
-                let mut parts = value.splitn(3, '\t');
-                let (Some(h), Some(pid), Some(class)) = (parts.next(), parts.next(), parts.next())
-                else {
+                let Some(e) = parse_entry(value) else {
                     continue;
-                };
-                let (Ok(hwnd), Ok(pid)) = (h.parse(), pid.parse()) else {
-                    continue;
-                };
-                let e = Entry {
-                    hwnd,
-                    pid,
-                    class: class.to_string(),
                 };
                 match key {
                     "hidden" => r.hidden.push(e),
                     "styled" => r.styled.push(e),
                     _ => r.topmost.push(e),
+                }
+            }
+            "captionless" => {
+                let Some((bits, fields)) = value.split_once('\t') else {
+                    continue;
+                };
+                if let (Ok(bits), Some(e)) = (bits.parse(), parse_entry(fields)) {
+                    r.captionless.push((e, bits));
                 }
             }
             "muted" if !value.is_empty() => r.muted.push(value.to_string()),

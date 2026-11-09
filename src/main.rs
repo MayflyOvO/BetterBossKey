@@ -109,23 +109,28 @@ fn main() {
         crate::win::window::restore_all_hidden();
         crate::win::window::restore_all_styled();
         crate::win::window::restore_all_topmost();
+        crate::win::window::restore_all_captions();
         default_hook(info);
     }));
 
     unsafe {
         let class_name = wide(APP_WINDOW_CLASS);
+        // 开机启动：只在后台运行，不弹出设置窗口。
+        let silent = std::env::args().skip(1).any(|a| a == win::autostart::SILENT_ARG);
 
         // —— 单实例 ——
         // 命名互斥体（名字用不透明 GUID，不含应用名）。分两种情况：
         //   · 接力重启中（见 win::disguise）：直接等前任释放互斥体，不去唤起窗口。
-        //   · 普通二次启动：立即唤起现有实例的设置窗口退出，不等待。
+        //   · 普通二次启动：立即唤起现有实例的设置窗口退出，不等待（开机启动则不唤起）。
         //     唤起不到窗口（前任退出中途）时再回退等待，避免接棒者误判成二次启动。
         if !acquire_single_instance(false) {
             let relay = win::disguise::relay_in_progress();
             if !relay {
                 let existing = FindWindowW(class_name.as_ptr(), std::ptr::null());
                 if !existing.is_null() {
-                    PostMessageW(existing, WM_APP_SHOW, 0, 0);
+                    if !silent {
+                        PostMessageW(existing, WM_APP_SHOW, 0, 0);
+                    }
                     return;
                 }
             }
@@ -142,7 +147,7 @@ fn main() {
                 cfg.origin = exe.to_string_lossy().into_owned();
                 cfg.save(); // 记住原始位置，供“关闭伪装”时重启回来
             }
-            if win::disguise::launch_disguised_copy(&mut cfg) {
+            if win::disguise::launch_disguised_copy(&mut cfg, silent) {
                 return;
             }
             // 复制 / 启动失败（个别杀软会拦）：回退为不伪装继续运行。
@@ -197,17 +202,19 @@ fn main() {
         // 用 SetWindowPos(SWP_SHOWWINDOW) 强制显示：ShowWindow 的首次调用会被
         // STARTUPINFO（例如以隐藏方式启动）覆盖而忽略参数，SetWindowPos 不受此限制。
         // 几何已在 WM_CREATE 的 resize_and_center 中设置好，这里只负责显示。
-        SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW,
-        );
-        SetForegroundWindow(hwnd);
-        UpdateWindow(hwnd);
+        if !silent {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW,
+            );
+            SetForegroundWindow(hwnd);
+            UpdateWindow(hwnd);
+        }
 
         // 消息循环。
         let mut msg: MSG = std::mem::zeroed();
@@ -641,6 +648,7 @@ unsafe extern "system" fn wndproc(
                 crate::win::window::restore_all_hidden();
                 crate::win::window::restore_all_styled();
                 crate::win::window::restore_all_topmost();
+                crate::win::window::restore_all_captions();
                 crate::recovery::persist();
             }
             0
@@ -661,6 +669,11 @@ unsafe extern "system" fn wndproc(
 
 /// 显示并激活设置窗口。
 unsafe fn show_settings(hwnd: HWND) {
+    // 开机启动可能已在任务管理器里被改动，打开时重新读取。
+    let ptr = app_from(hwnd);
+    if !ptr.is_null() {
+        (*ptr).refresh_autostart();
+    }
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
     invalidate(hwnd);

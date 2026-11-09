@@ -62,6 +62,7 @@ pub enum Hot {
     Mute,
     Cover,
     Topmost,
+    Captionless,
     AutoHide,
     DelayMinus,
     DelayPlus,
@@ -79,6 +80,7 @@ pub enum Hot {
     Slider,
     ClickThrough,
     Wheel,
+    Autostart,
     Disguise,
     Tray,
     HideAll,
@@ -186,7 +188,7 @@ impl Stepper {
 /// 一次布局计算的结果（物理像素）。绘制与命中测试共用。
 ///
 /// 左栏：窗口列表卡片（含底部“拾取窗口”）、老板键、摸鱼统计、操作按钮；
-/// 右栏：隐藏 / 显示时的动作、自动隐藏条件、半透明、隐蔽。
+/// 右栏：隐藏 / 显示时的动作、自动隐藏条件、半透明、运行方式。
 pub struct Layout {
     pub height_needed: i32,
     /// 窗口列表卡片（含底部“拾取窗口”）。
@@ -207,6 +209,7 @@ pub struct Layout {
     pub mute: Field,
     pub cover: Field,
     pub topmost: Field,
+    pub captionless: Field,
     pub auto_hide: Field,
     pub hide_delay: Stepper,
     pub reveal_delay: Stepper,
@@ -221,6 +224,7 @@ pub struct Layout {
     pub slider_track: RECT,
     pub click_through: Field,
     pub wheel: Field,
+    pub autostart: Field,
     pub disguise: Field,
     pub tray: Field,
     pub dividers: Vec<RECT>,
@@ -248,6 +252,7 @@ impl Default for Layout {
             mute: Field::NONE,
             cover: Field::NONE,
             topmost: Field::NONE,
+            captionless: Field::NONE,
             auto_hide: Field::NONE,
             hide_delay: Stepper::NONE,
             reveal_delay: Stepper::NONE,
@@ -261,6 +266,7 @@ impl Default for Layout {
             slider_track: ZERO,
             click_through: Field::NONE,
             wheel: Field::NONE,
+            autostart: Field::NONE,
             disguise: Field::NONE,
             tray: Field::NONE,
             dividers: Vec::new(),
@@ -373,10 +379,12 @@ impl App {
         // —— 隐藏 / 显示时的动作 ——
         let mute = toggle(&mut y, rl, rr, false);
         let cover = toggle(&mut y, rl, rr, false);
-        let topmost = toggle(&mut y, rl, rr, true);
+        let topmost = toggle(&mut y, rl, rr, false);
+        let captionless = toggle(&mut y, rl, rr, true);
         hits.push((mute.row, Hot::Mute));
         hits.push((cover.row, Hot::Cover));
         hits.push((topmost.row, Hot::Topmost));
+        hits.push((captionless.row, Hot::Captionless));
         divider(&mut y, rl, rr, &mut dividers);
 
         // —— 自动隐藏条件：鼠标移出（及其子项）、屏幕角、离开、接投影、耳机断开 ——
@@ -430,9 +438,11 @@ impl App {
         }
         divider(&mut y, rl, rr, &mut dividers);
 
-        // —— 隐蔽 ——
+        // —— 运行方式：开机启动、隐蔽 ——
+        let autostart = toggle(&mut y, rl, rr, false);
         let disguise = toggle(&mut y, rl, rr, false);
         let tray = toggle(&mut y, rl, rr, true);
+        hits.push((autostart.row, Hot::Autostart));
         hits.push((disguise.row, Hot::Disguise));
         hits.push((tray.row, Hot::Tray));
         let bottom = y;
@@ -525,6 +535,7 @@ impl App {
             mute,
             cover,
             topmost,
+            captionless,
             auto_hide,
             hide_delay,
             reveal_delay,
@@ -538,6 +549,7 @@ impl App {
             slider_track,
             click_through,
             wheel,
+            autostart,
             disguise,
             tray,
             dividers,
@@ -604,6 +616,7 @@ impl App {
         self.draw_toggle_field(c, &layout.mute, "隐藏时静音", self.cfg.mute_on_hide, true, Hot::Mute);
         self.draw_toggle_field(c, &layout.cover, "切回工作窗口", self.cfg.cover, true, Hot::Cover);
         self.draw_toggle_field(c, &layout.topmost, "显示时置顶", self.cfg.topmost, true, Hot::Topmost);
+        self.draw_toggle_field(c, &layout.captionless, "去掉标题栏", self.cfg.captionless, true, Hot::Captionless);
 
         let auto = self.cfg.auto_hide;
         self.draw_toggle_field(c, &layout.auto_hide, "鼠标移出隐藏", self.cfg.auto_hide, true, Hot::AutoHide);
@@ -635,6 +648,7 @@ impl App {
         self.draw_toggle_field(c, &layout.click_through, "鼠标穿透", self.cfg.click_through, trans, Hot::ClickThrough);
         self.draw_toggle_field(c, &layout.wheel, "Alt + 滚轮调节", self.cfg.wheel_opacity, trans, Hot::Wheel);
 
+        self.draw_toggle_field(c, &layout.autostart, "开机启动", self.autostart, true, Hot::Autostart);
         self.draw_toggle_field(c, &layout.disguise, "进程伪装", self.cfg.disguise, true, Hot::Disguise);
         self.draw_toggle_field(c, &layout.tray, "托盘图标", self.cfg.tray_icon, true, Hot::Tray);
 
@@ -963,6 +977,7 @@ impl App {
             Hot::Mute => self.set_mute_on_hide(!self.cfg.mute_on_hide),
             Hot::Cover => self.set_cover(!self.cfg.cover),
             Hot::Topmost => self.set_topmost(!self.cfg.topmost),
+            Hot::Captionless => self.set_captionless(!self.cfg.captionless),
             Hot::Corner => self.set_corner(if self.cfg.corner == 0 { DEFAULT_CORNER } else { 0 }),
             Hot::CornerAt(k) => self.set_corner(if self.cfg.corner == k { 0 } else { k }),
             Hot::Away => self.set_hide_on_away(!self.cfg.hide_on_away),
@@ -971,6 +986,7 @@ impl App {
             Hot::ClickThrough => self.set_click_through(!self.cfg.click_through),
             Hot::Wheel => self.set_wheel_opacity(!self.cfg.wheel_opacity),
             Hot::Tray => self.set_tray_icon(!self.cfg.tray_icon),
+            Hot::Autostart => self.set_autostart(!self.autostart),
             // set_delay / set_reveal_delay 内部已 clamp 到 [MIN_DELAY_MS, MAX_DELAY_MS]。
             Hot::DelayMinus => self.set_delay(self.cfg.auto_hide_delay_ms.saturating_sub(DELAY_STEP_MS)),
             Hot::DelayPlus => self.set_delay((self.cfg.auto_hide_delay_ms + DELAY_STEP_MS).min(MAX_DELAY_MS)),

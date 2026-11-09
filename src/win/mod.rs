@@ -8,11 +8,13 @@
 //! * [`tray`]   系统托盘图标
 //! * [`icon`]   从 exe 资源加载应用图标
 //! * [`disguise`] 进程伪装（随机名临时副本运行）
+//! * [`autostart`] 开机启动（HKCU 的 Run 注册项）
 //!
 //! 另外提供 DPI 相关的小工具。进程级 DPI 感知由 app.manifest 声明
 //! （Per-Monitor V2），运行时只需按窗口 DPI 做尺寸换算。
 
 pub mod audio;
+pub mod autostart;
 pub mod disguise;
 pub mod hotkey;
 pub mod icon;

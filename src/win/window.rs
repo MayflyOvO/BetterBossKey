@@ -1,4 +1,4 @@
-//! 顶层窗口的枚举与操作：隐藏 / 显示 / 半透明 / 置顶。
+//! 顶层窗口的枚举与操作：隐藏 / 显示 / 半透明 / 置顶 / 去掉标题栏。
 //!
 //! HWND 在内部以 `isize` 形式保存（便于比较、克隆与持久化），调用 Win32 API
 //! 时再转换回指针类型。所有操作前都会用 `IsWindow` 校验句柄是否仍然有效，
@@ -17,9 +17,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, LWA_ALPHA,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNA,
-    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST,
+    LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_RESTORE, SW_SHOW, SW_SHOWNA, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_THICKFRAME,
 };
 
 use crate::util::from_wide;
@@ -40,6 +41,13 @@ static STYLED_WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 
 /// 被本程序设为置顶的窗口登记表，兜底方式同上。原本就置顶的窗口不登记，撤销时也不动它。
 static TOPMOST_WINDOWS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// 被本程序去掉了标题栏的窗口登记表：句柄及去掉的样式位（撤销时原样补回），兜底方式同上。
+static CAPTIONLESS_WINDOWS: Mutex<Vec<(isize, u32)>> = Mutex::new(Vec::new());
+
+/// 去掉标题栏时一并去掉的样式：标题栏本身，以及缩放边框——只去标题栏的话，
+/// 缩放边框会在窗口顶部留下一条浅色边，且跨进程无法改它的颜色。
+const FRAME_STYLE: u32 = WS_CAPTION | WS_THICKFRAME;
 
 /// 一个可被管理的顶层窗口的快照信息。
 #[derive(Clone)]
@@ -332,7 +340,7 @@ pub fn restore_all_styled() {
 }
 
 /// 取出并清空登记表（try_lock，理由见 [`restore_all_hidden`]）。
-fn drain(reg: &Mutex<Vec<isize>>) -> Vec<isize> {
+fn drain<T>(reg: &Mutex<Vec<T>>) -> Vec<T> {
     use std::sync::TryLockError;
     let mut guard = match reg.try_lock() {
         Ok(g) => g,
@@ -349,10 +357,26 @@ pub fn restore_all_topmost() {
     }
 }
 
-/// 三张登记表的快照（隐藏的、被改了样式的、被置顶的），供崩溃恢复文件持久化。
-pub fn registry_snapshot() -> (Vec<isize>, Vec<isize>, Vec<isize>) {
+/// 补回所有登记在册窗口的标题栏并清空登记表。用途同 [`restore_all_hidden`]。
+pub fn restore_all_captions() {
+    for (h, bits) in drain(&CAPTIONLESS_WINDOWS) {
+        reset_caption(h, bits);
+    }
+}
+
+/// 各登记表的快照及其在崩溃恢复文件中的键名，供 [`crate::recovery`] 持久化。
+pub fn registry_snapshot() -> [(&'static str, Vec<isize>); 3] {
     let get = |reg: &Mutex<Vec<isize>>| reg.try_lock().map(|v| v.clone()).unwrap_or_default();
-    (get(&HIDDEN_WINDOWS), get(&STYLED_WINDOWS), get(&TOPMOST_WINDOWS))
+    [
+        ("hidden", get(&HIDDEN_WINDOWS)),
+        ("styled", get(&STYLED_WINDOWS)),
+        ("topmost", get(&TOPMOST_WINDOWS)),
+    ]
+}
+
+/// 去掉了标题栏的窗口及去掉的样式位，供 [`crate::recovery`] 持久化。
+pub fn captionless_snapshot() -> Vec<(isize, u32)> {
+    CAPTIONLESS_WINDOWS.try_lock().map(|v| v.clone()).unwrap_or_default()
 }
 
 /// 窗口当前是否置顶。
@@ -393,6 +417,86 @@ pub fn reset_topmost(hwnd: isize) {
 fn place_z(hwnd: isize, after: HWND) {
     unsafe {
         SetWindowPos(as_hwnd(hwnd), after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+/// 去掉窗口的标题栏与缩放边框，并登记去掉的样式位以便撤销。窗口矩形不变，
+/// 原先不可见的缩放边框区域变为客户区，可见部分因此左、右、下各外扩几个像素。
+///
+/// 只处理带完整 `WS_CAPTION` 的窗口：自绘标题栏的程序（浏览器、Electron、UWP 等）
+/// 本就没有它，保持原样。已去掉的再调用是空操作，因此可周期性调用，抵消目标程序自行恢复标题栏。
+pub fn remove_caption(hwnd: isize) {
+    if !is_alive(hwnd) {
+        return;
+    }
+    let h = as_hwnd(hwnd);
+    let style = unsafe { GetWindowLongPtrW(h, GWL_STYLE) } as u32;
+    if style & WS_CAPTION != WS_CAPTION {
+        return;
+    }
+    let bits = style & FRAME_STYLE;
+    register_captionless(hwnd, bits);
+    unsafe {
+        SetWindowLongPtrW(h, GWL_STYLE, (style & !bits) as isize);
+    }
+    refresh_frame(h);
+}
+
+/// 补回由本程序去掉的标题栏（其它窗口不受影响）。
+pub fn restore_caption(hwnd: isize) {
+    let removed = match CAPTIONLESS_WINDOWS.lock() {
+        Ok(mut v) => v.iter().position(|&(h, _)| h == hwnd).map(|i| v.remove(i)),
+        Err(_) => None,
+    };
+    if let Some((h, bits)) = removed {
+        crate::recovery::persist();
+        reset_caption(h, bits);
+    }
+}
+
+/// 登记到标题栏兜底表（不改变窗口样式），`bits` 为去掉的样式位。已登记的保留原记录：
+/// 目标程序自行恢复标题栏后再次去掉时，要补回的仍是最初去掉的样式。
+/// 也用于接管上次运行时被我们去掉标题栏的窗口。
+pub fn register_captionless(hwnd: isize, bits: u32) {
+    let added = match CAPTIONLESS_WINDOWS.lock() {
+        Ok(mut v) if !v.iter().any(|&(h, _)| h == hwnd) => {
+            v.push((hwnd, bits));
+            true
+        }
+        _ => false,
+    };
+    if added {
+        crate::recovery::persist();
+    }
+}
+
+/// 无条件补回去掉的样式位。
+pub fn reset_caption(hwnd: isize, bits: u32) {
+    if !is_alive(hwnd) {
+        return;
+    }
+    let h = as_hwnd(hwnd);
+    let style = unsafe { GetWindowLongPtrW(h, GWL_STYLE) } as u32;
+    if style & bits != bits {
+        unsafe {
+            SetWindowLongPtrW(h, GWL_STYLE, (style | bits) as isize);
+        }
+        refresh_frame(h);
+    }
+}
+
+/// 让窗口按新样式重新计算并绘制非客户区。
+fn refresh_frame(h: HWND) {
+    unsafe {
+        SetWindowPos(
+            h,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 }
 

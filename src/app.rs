@@ -2,7 +2,7 @@
 //!
 //! `App` 持有全部运行时状态，并实现各项功能：
 //!   1. 老板键：一键隐藏 / 恢复所有受管窗口（全局热键触发），可选按住显示
-//!   2. 隐藏 / 显示时的附带动作：静音、切回工作窗口、显示时置顶
+//!   2. 隐藏 / 显示时的附带动作：静音、切回工作窗口、显示时置顶、去掉标题栏
 //!   3. 自动隐藏：鼠标移出、屏幕角、锁屏 / 熄屏、接投影、耳机断开
 //!   4. 半透明：可调不透明度、鼠标穿透、Alt+滚轮调节
 //!   5. 摸鱼统计、崩溃恢复
@@ -236,6 +236,8 @@ pub struct App {
     stats_saved: u64,
     /// 上次显示的统计文本（变化时刷新托盘提示与界面）。
     stats_shown: String,
+    /// 开机启动是否生效（状态以注册表为准，见 [`win::autostart`]）。
+    pub autostart: bool,
 }
 
 impl App {
@@ -273,6 +275,7 @@ impl App {
             stats_tick: None,
             stats_saved,
             stats_shown: String::new(),
+            autostart: false,
         };
         app.recover();
         app
@@ -339,6 +342,16 @@ impl App {
                 window::reset_topmost(e.hwnd);
             }
         }
+        for (e, bits) in &rec.captionless {
+            if !e.is_same_window() {
+                continue;
+            }
+            if self.cfg.captionless && self.is_managed(e.hwnd) {
+                window::register_captionless(e.hwnd, *bits);
+            } else {
+                window::reset_caption(e.hwnd, *bits);
+            }
+        }
         crate::recovery::persist();
     }
 
@@ -365,6 +378,9 @@ impl App {
         if self.cfg.stats {
             self.roll_stats_day();
         }
+        // 程序被移动或切换了伪装时，让开机启动指向当前的 exe。
+        win::autostart::sync(&self.cfg.alias);
+        self.refresh_autostart();
         self.update_tray_tip();
     }
 
@@ -439,6 +455,9 @@ impl App {
             if self.cfg.topmost && !t.hidden_by_us {
                 window::set_topmost(hwnd);
             }
+            if self.cfg.captionless {
+                window::remove_caption(hwnd);
+            }
             self.targets.push(t);
         }
     }
@@ -477,6 +496,7 @@ impl App {
                     window::clear_opacity(removed.hwnd);
                 }
                 window::clear_topmost(removed.hwnd);
+                window::restore_caption(removed.hwnd);
             }
             // 从记忆表删除对应记忆项，使其不再跨重启自动恢复。规则：
             //   · 若某记忆项仍被“另一个存活目标”严格支撑（该目标的记忆标识恰好等于此项），
@@ -515,6 +535,9 @@ impl App {
             }
             if self.cfg.topmost {
                 window::set_topmost(hwnd);
+            }
+            if self.cfg.captionless {
+                window::remove_caption(hwnd);
             }
             // 记入记忆表（去重），以便跨重启自动恢复。t.remembered 即“此刻加入”的身份。
             if !self
@@ -567,6 +590,7 @@ impl App {
                     window::clear_opacity(t.hwnd);
                 }
                 window::clear_topmost(t.hwnd);
+                window::restore_caption(t.hwnd);
             }
             self.targets.remove(pos);
         }
@@ -866,6 +890,24 @@ impl App {
             if window::is_visible(t.hwnd) && !window::is_topmost(t.hwnd) {
                 window::set_topmost(t.hwnd);
             }
+        }
+    }
+
+    /// 开 / 关“去掉标题栏”。关闭时补回本程序去掉的标题栏。
+    pub fn set_captionless(&mut self, on: bool) {
+        self.cfg.captionless = on;
+        if on {
+            self.keep_captionless();
+        } else {
+            window::restore_all_captions();
+        }
+        self.cfg.save();
+    }
+
+    /// 去掉受管窗口的标题栏（刚开启，或目标程序自行恢复了标题栏）。
+    fn keep_captionless(&self) {
+        for t in self.targets.iter().filter(|t| target_live(t)) {
+            window::remove_caption(t.hwnd);
         }
     }
 
@@ -1203,6 +1245,17 @@ impl App {
         self.cfg.save();
     }
 
+    // —— 开机启动 ——
+
+    pub fn set_autostart(&mut self, on: bool) {
+        win::autostart::set(on, &self.cfg.alias);
+        self.refresh_autostart();
+    }
+
+    pub fn refresh_autostart(&mut self) {
+        self.autostart = win::autostart::is_enabled(&self.cfg.alias);
+    }
+
     // —— 进程伪装 ——
 
     /// 开 / 关进程伪装，并立即以新形态重启自己，让效果当场可见。
@@ -1224,13 +1277,13 @@ impl App {
                 self.cfg.origin = exe.to_string_lossy().into_owned();
             }
             self.cfg.save();
-            if win::disguise::launch_disguised_copy(&mut self.cfg) {
+            if win::disguise::launch_disguised_copy(&mut self.cfg, false) {
                 self.relaunch_exit();
             }
         } else {
             self.cfg.save();
             let origin = std::path::PathBuf::from(&self.cfg.origin);
-            if !self.cfg.origin.is_empty() && origin.is_file() && win::disguise::spawn(&origin) {
+            if !self.cfg.origin.is_empty() && origin.is_file() && win::disguise::spawn(&origin, false) {
                 self.relaunch_exit();
             }
         }
@@ -1650,6 +1703,9 @@ impl App {
         if self.cfg.topmost {
             self.keep_topmost();
         }
+        if self.cfg.captionless {
+            self.keep_captionless();
+        }
 
         let mut stats_changed = false;
         if self.cfg.stats {
@@ -1670,7 +1726,7 @@ impl App {
         before != after || before_targets != self.targets.len() || stats_changed
     }
 
-    /// 退出前的清理：恢复所有被我们隐藏 / 半透明 / 静音的窗口，释放资源。
+    /// 退出前的清理：恢复所有被我们隐藏 / 半透明 / 置顶 / 去掉标题栏 / 静音的窗口，释放资源。
     /// 重启接力（`relaunching`）时跳过恢复——窗口保持现状，由下一个进程接管。
     pub fn cleanup(&mut self) {
         self.peeking = None;
@@ -1684,6 +1740,7 @@ impl App {
             window::restore_all_hidden();
             window::restore_all_styled();
             window::restore_all_topmost();
+            window::restore_all_captions();
             audio::unmute_all();
         }
         if self.cfg.stats {

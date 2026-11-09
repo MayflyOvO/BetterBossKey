@@ -19,6 +19,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::config::Config;
 use crate::util::wide;
+use crate::win::autostart::SILENT_ARG;
 
 /// “接力重启”标记事件：切换伪装时由前一个进程在启动接棒者之前创建。
 /// 接棒者据此走“等待前任退出”的路径，而不是“唤起现有窗口”的路径。
@@ -119,16 +120,18 @@ pub fn is_disguised() -> bool {
 
 /// 启动一个进程并立即与之脱钩。用于“接力重启”（见 [`crate::app`] 的伪装切换）
 /// 与启动伪装副本，后者会先创建接力标记让接棒者走等待路径。成功返回 true。
-pub fn spawn(exe: &Path) -> bool {
+/// `silent` 为 true 时附带开机启动参数，接棒者不弹出设置窗口。
+pub fn spawn(exe: &Path, silent: bool) -> bool {
     create_relay_marker();
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let app = wide(&exe.to_string_lossy());
+    let mut cmdline = wide(&format!("\"{}\" {}", exe.display(), SILENT_ARG));
     let ok = unsafe {
         CreateProcessW(
             app.as_ptr(),
-            std::ptr::null_mut(),
+            if silent { cmdline.as_mut_ptr() } else { std::ptr::null_mut() },
             std::ptr::null(),
             std::ptr::null(),
             0,
@@ -150,7 +153,7 @@ pub fn spawn(exe: &Path) -> bool {
 
 /// 把自己复制为别名副本并启动。成功返回 true（调用方应随即退出），
 /// 并在成功时把所用别名写入 `cfg` 持久化（首次生成，之后固定复用）。
-pub fn launch_disguised_copy(cfg: &mut Config) -> bool {
+pub fn launch_disguised_copy(cfg: &mut Config, silent: bool) -> bool {
     let Ok(src) = std::env::current_exe() else {
         return false;
     };
@@ -171,11 +174,11 @@ pub fn launch_disguised_copy(cfg: &mut Config) -> bool {
         // 目标不存在，或删得掉（正常运行中不会有本程序的副本在跑：单实例已挡住）
         // 才重新复制；删不掉说明文件被占用（如杀软扫描中），退而启动已有副本。
         if !dst.exists() || std::fs::remove_file(&dst).is_ok() {
-            if std::fs::copy(&src, &dst).is_ok() && spawn(&dst) {
+            if std::fs::copy(&src, &dst).is_ok() && spawn(&dst, silent) {
                 cfg.save();
                 return true;
             }
-        } else if spawn(&dst) {
+        } else if spawn(&dst, silent) {
             // 沿用上次的副本文件：别名未变，它就是本程序的副本。
             return true;
         }

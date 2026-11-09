@@ -99,6 +99,8 @@ pub struct Config {
     pub cover: bool,
     /// 受管窗口被显示时设为置顶（目标程序自行取消时重新置顶）。
     pub topmost: bool,
+    /// 去掉受管窗口的系统标题栏（目标程序自行恢复时重新去掉）。
+    pub captionless: bool,
     /// 鼠标甩到屏幕角时隐藏：0 = 关，1 左上，2 右上，3 左下，4 右下。
     pub corner: u8,
     /// 锁屏或熄屏时隐藏。
@@ -152,6 +154,7 @@ impl Default for Config {
             mute_on_hide: false,
             cover: false,
             topmost: false,
+            captionless: false,
             corner: 0,
             hide_on_away: false,
             hide_on_projector: false,
@@ -254,6 +257,7 @@ impl Config {
                 "mute_on_hide" => cfg.mute_on_hide = on,
                 "cover" => cfg.cover = on,
                 "topmost" => cfg.topmost = on,
+                "captionless" => cfg.captionless = on,
                 "corner" => {
                     if let Ok(v) = value.parse::<u8>() {
                         cfg.corner = if v <= 4 { v } else { 0 };
@@ -320,6 +324,7 @@ impl Config {
         out.push_str(&format!("mute_on_hide={}\n", b(self.mute_on_hide)));
         out.push_str(&format!("cover={}\n", b(self.cover)));
         out.push_str(&format!("topmost={}\n", b(self.topmost)));
+        out.push_str(&format!("captionless={}\n", b(self.captionless)));
         out.push_str(&format!("corner={}\n", self.corner));
         out.push_str(&format!("hide_on_away={}\n", b(self.hide_on_away)));
         out.push_str(&format!("hide_on_projector={}\n", b(self.hide_on_projector)));
