@@ -1,0 +1,45 @@
+[package]
+name = "better-boss-key"
+version = "1.0.0"
+edition = "2021"
+description = "BetterBossKey - 轻量级 Windows 窗口隐藏 / 半透明 / 老板键工具"
+authors = ["MayflyOvO <ckmiaojapan@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/MayflyOvO/BetterBossKey"
+build = "build.rs"
+
+[[bin]]
+name = "BetterBossKey"
+path = "src/main.rs"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Controls",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+]
+
+# 体积优化：静态 CRT(见 .cargo/config.toml) + 下面的 release 配置，
+# 目标是产出一个无外部依赖的小体积单文件 exe。
+[profile.release]
+opt-level = "z"   # 体积优先
+lto = true        # 链接期优化，去除未用代码
+codegen-units = 1 # 更强的跨模块优化
+panic = "abort"   # GUI 程序不需要 unwind，进一步缩小体积
+strip = true      # 去除符号表
+
+# debug 也用 abort，与 release 一致：wndproc/enum_proc 是 extern "system" 回调，
+# 由 Win32 跨 FFI 边界调用，panic 在此 unwind 不安全。abort 仍会先打印 panic 信息。
+[profile.dev]
+panic = "abort"

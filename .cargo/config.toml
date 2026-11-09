@@ -1,0 +1,4 @@
+# 静态链接 C 运行时(CRT)，使最终的 exe 不依赖 VC++ 运行库(VCRUNTIME140.dll 等)。
+# 这是实现“用户无需安装任何额外依赖”的关键开关。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
