@@ -126,11 +126,8 @@ fn target_live(t: &Target) -> bool {
 /// 以「进程名」为锚——用户重启的是某个“软件”，进程名最稳定；再要求类名或标题至少
 /// 命中其一，以免误抓同进程的无关窗口（如控制台）。这样无论标题是动态的，还是窗口类名
 /// 随进程变化（某些框架如此），只要该软件再次出现就能被认出。命中越多分越高，便于在
-/// 多个同进程窗口里挑最贴近的。旧版仅含标题的记忆项退回按标题匹配。
+/// 多个同进程窗口里挑最贴近的。
 fn match_score(exe: &str, class: &str, title: &str, rt: &RememberedTarget) -> i32 {
-    if rt.exe.is_empty() && rt.class.is_empty() {
-        return if title == rt.title { 1 } else { 0 };
-    }
     if !exe.eq_ignore_ascii_case(&rt.exe) {
         return 0; // 进程名必须一致
     }
@@ -263,7 +260,6 @@ impl App {
         let remembered = self.cfg.remembered_targets.clone();
         let alpha = opacity_to_alpha(self.cfg.opacity);
         let trans = self.cfg.transparency_enabled;
-        let mut upgraded = false;
         for rt in &remembered {
             // 已有对应存活目标 → 视为已满足，避免重复挂接。
             // 用严格标识判定（而非模糊 match_score）：只有当某个存活目标的“记忆标识”
@@ -295,26 +291,7 @@ impl App {
                 window::set_opacity(hwnd, alpha);
                 t.opacity_applied = true;
             }
-            // 旧版（仅标题）记忆项升级为带 进程名 + 类名 的富标识，便于后续更稳地再匹配。
-            if rt.exe.is_empty() && rt.class.is_empty() {
-                if let Some(r) = self
-                    .cfg
-                    .remembered_targets
-                    .iter_mut()
-                    .find(|r| r.exe.is_empty() && r.class.is_empty() && r.title == rt.title)
-                {
-                    r.exe = t.exe.clone();
-                    r.class = t.class.clone();
-                    upgraded = true;
-                }
-                // 记忆项已升级为带 exe/class，目标的记忆标识同步升级，二者保持一致。
-                t.remembered.exe = t.exe.clone();
-                t.remembered.class = t.class.clone();
-            }
             self.targets.push(t);
-        }
-        if upgraded {
-            self.cfg.save();
         }
     }
 
@@ -361,8 +338,8 @@ impl App {
             //     释放的窗口会模糊命中的“同一进程”离线兄弟项——否则该离线项会在下个维护
             //     tick 用 find_window_for 把刚释放的窗口重新抓回来，重现“取消后对勾又恢复”
             //     （同 exe+类名的多窗口用现有标识无法区分，只能牺牲已关闭兄弟项的持久化，
-            //     换取“取消一定生效”这一用户核心诉求）。模糊删除仅限带 exe 的项，避免旧版
-            //     仅标题记忆项被“标题恰好相同的其它进程窗口”跨进程误删。
+            //     换取“取消一定生效”这一用户核心诉求）。模糊删除仅限带 exe 的项：读不到
+            //     进程名的项无法区分进程，模糊命中可能跨进程误删。
             let others = &self.targets;
             self.cfg.remembered_targets.retain(|r| {
                 if others

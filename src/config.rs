@@ -23,9 +23,9 @@ pub const MAX_DELAY_MS: u32 = 5000;
 /// `进程名 + 类名` 把它重新认出来。
 #[derive(Clone)]
 pub struct RememberedTarget {
-    /// 进程可执行文件名，如 `phoneCast.exe`（旧版配置可能为空）。
+    /// 进程可执行文件名，如 `phoneCast.exe`（读不到进程名时为空）。
     pub exe: String,
-    /// 窗口类名（旧版配置可能为空）。
+    /// 窗口类名。
     pub class: String,
     /// 选中时的窗口标题。
     pub title: String,
@@ -89,26 +89,16 @@ fn encode_target(t: &RememberedTarget) -> String {
     format!("{}\t{}\t{}", clean(&t.exe), clean(&t.class), clean(&t.title))
 }
 
-/// 解析 `target=` 行的值（未 trim，保留标题空白）。
-/// 新格式为 `exe<TAB>class<TAB>title`；旧格式只有纯标题，按只含标题处理。
+/// 解析 `target=` 行的值（未 trim，保留标题空白）：`exe<TAB>class<TAB>title`。
 fn decode_target(raw: &str) -> Option<RememberedTarget> {
-    if raw.is_empty() {
-        return None;
-    }
     let mut parts = raw.splitn(3, '\t');
-    let first = parts.next().unwrap_or("");
-    match (parts.next(), parts.next()) {
-        (Some(class), Some(title)) => Some(RememberedTarget {
-            exe: first.to_string(),
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(exe), Some(class), Some(title)) => Some(RememberedTarget {
+            exe: exe.to_string(),
             class: class.to_string(),
             title: title.to_string(),
         }),
-        // 旧版：整行就是标题。
-        _ => Some(RememberedTarget {
-            exe: String::new(),
-            class: String::new(),
-            title: raw.to_string(),
-        }),
+        _ => None,
     }
 }
 
@@ -148,13 +138,6 @@ impl Config {
             let key = key.trim();
             let value = raw_value.trim();
             match key {
-                // 旧版单一热键：同时作为隐藏键与显示键（即切换键），保持升级后行为一致。
-                "hotkey" => {
-                    if let Some(hk) = Hotkey::parse(value) {
-                        cfg.hide_hotkey = hk;
-                        cfg.show_hotkey = hk;
-                    }
-                }
                 "hide_hotkey" => {
                     if let Some(hk) = Hotkey::parse(value) {
                         cfg.hide_hotkey = hk;

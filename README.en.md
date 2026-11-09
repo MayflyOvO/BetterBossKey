@@ -99,8 +99,6 @@ disguise=1              # Process disguise: run as a fixed-alias copy (alias= is
 target=phoneCast.exe	CabinetWClass	投屏窗口   # process name<TAB>class name<TAB>title, used to re-match across restarts
 ```
 
-> Backward compatibility: the old `hotkey=` is read as both the hide and show key (i.e. a toggle); old title-only `target=` lines are still recognized.
-
 ## 📄 License
 
 [MIT](LICENSE) © MayflyOvO

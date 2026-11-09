@@ -97,8 +97,6 @@ disguise=1              # 进程伪装：以固定别名副本运行（alias= �
 target=phoneCast.exe	CabinetWClass	投屏窗口   # 进程名<TAB>类名<TAB>标题，用于跨重启再匹配
 ```
 
-> 兼容旧版：旧的 `hotkey=` 会被读作隐藏键与显示键同一个键（即切换键）；只有标题的旧 `target=` 行仍可识别。
-
 ## 📄 许可证
 
 [MIT](LICENSE) © MayflyOvO
